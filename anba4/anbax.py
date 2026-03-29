@@ -634,16 +634,15 @@ class Anbax:
         # Index 4: EI33 (bending about x3) - from chain 2 with (d1, d2)
         K[4, 4] = stiffness_term(d1_2, d2_2)
 
-        # Index 0: GA22 (shear in x2) - using (d0, d2) pair with correction factor
-        # The shear stiffness requires a different formula: GA = 0.75 * S(d0, d2)
-        # This accounts for the B/G transformation in the original ANBA4 formulation
-        K[0, 0] = 0.75 * stiffness_term(d0_2, d2_2)
+        # Index 0: GA22 (shear in x2) - using (d0, d2) pair
+        # The shear stiffness is computed exactly with warping effects
+        K[0, 0] = stiffness_term(d0_2, d2_2)
 
         # Index 3: EI22 (bending about x2) - from chain 3 with (d1, d2)
         K[3, 3] = stiffness_term(d1_3, d2_3)
 
-        # Index 1: GA33 (shear in x3) - using (d0, d2) pair with correction factor
-        K[1, 1] = 0.75 * stiffness_term(d0_3, d2_3)
+        # Index 1: GA33 (shear in x3) - using (d0, d2) pair
+        K[1, 1] = stiffness_term(d0_3, d2_3)
 
         # Cross terms (off-diagonal)
         # For a symmetric section centered at origin, most cross terms should be zero
@@ -662,7 +661,7 @@ class Anbax:
         # Using (d0, d2) pair for shear-related cross terms (with 0.75 factor)
 
         # Shear V2 - Shear V3 (0,1)
-        K[0, 1] = 0.75 * cross_stiffness(d0_2, d2_2, d0_3, d2_3)
+        K[0, 1] = cross_stiffness(d0_2, d2_2, d0_3, d2_3)
         K[1, 0] = K[0, 1]
 
         return K, chains
