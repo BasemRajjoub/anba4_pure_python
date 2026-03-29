@@ -1,12 +1,28 @@
-# ANBA4-skfem
+# ANBA4
 
-A FEniCS-free port of ANBA4 for cross-section beam analysis using scikit-fem.
+ANBA4 computes the 6x6 stiffness and mass matrices of arbitrarily complex composite beam cross sections.
 
 ## Description
 
-ANBA4-skfem computes 6x6 stiffness and mass matrices of composite beam cross sections based on the generalized eigenvector theory from Morandini et al. (2010) "Characteristic behavior of prismatic anisotropic beam via generalized eigenvectors".
+ANBA4-skfem is a FEniCS-free port of ANBA4 using scikit-fem for FEM assembly and scipy for linear algebra, enabling Windows compatibility without requiring FEniCS installation.
 
-This port replaces FEniCS with scikit-fem for FEM assembly and scipy for linear algebra, enabling Windows compatibility without requiring FEniCS installation.
+The method is based on the generalized eigenvector theory from Morandini et al. (2010). ANBA4 has been verified against the commercial solver VABS and validated against experimental measurements.
+
+## Theory
+
+The theory of ANBA4 is described in this work (and references therein):
+
+**Morandini, M., Chierichetti, M., & Mantegazza, P.** (2010).
+"Characteristic behavior of prismatic anisotropic beam via generalized eigenvectors."
+*International Journal of Solids and Structures*, 47(10), 1327-1337.
+https://doi.org/10.1016/j.ijsolstr.2010.01.017
+
+ANBA4 has recently been verified against the commercial solver VABS and validated against experimental measurements:
+
+**Feil, R., Pflumm, T., Bortolotti, P., & Morandini, M.** (2020).
+"A cross-sectional aeroelastic analysis and structural optimization tool for slender composite structures."
+*Composite Structures*, 253, 112755.
+https://doi.org/10.1016/j.compstruct.2020.112755
 
 ## Features
 
@@ -16,6 +32,7 @@ This port replaces FEniCS with scikit-fem for FEM assembly and scipy for linear 
 - Support for isotropic and orthotropic materials
 - Triangular and quadrilateral meshes
 - Linear and quadratic elements
+- Cross-platform compatibility (Windows, Linux, macOS)
 
 ## Installation
 
@@ -77,15 +94,30 @@ The 6x6 stiffness matrix uses the following convention:
 Stress and strain vectors use ANBA ordering:
 - [σ11, σ22, σ33, σ23, σ13, σ12]
 
+## About This Port
+
+This implementation replaces the original FEniCS/PETSc backend with scikit-fem and scipy, making ANBA4 available on Windows without requiring complex C++ build tools or FEniCS installation. The numerical algorithms and physical methods remain unchanged from the original.
+
+**Key improvements:**
+- Works natively on Windows, Linux, and macOS
+- Pure Python implementation (except scikit-fem itself)
+- Pip-installable with no C++ compiler required
+- Fully compatible with modern Python ecosystems
+- Identical numerical results to original ANBA4
+
 ## License
 
-GNU General Public License v3
+GNU General Public License v3 - see COPYING file for details.
 
 ## Credits
 
-Original ANBA4:
+**Original ANBA4:**
 - Copyright (C) 2018 Marco Morandini
-- https://github.com/manuelma/anba4
+- https://github.com/ANBA4/anba4
 
-scikit-fem port:
+**scikit-fem port:**
 - Copyright (C) 2024-2026 Basem Rajjoub
+
+**Theory and validation:**
+- Marco Morandini, Maria Chierichetti, Paolo Mantegazza (theory)
+- Roland Feil, Tobias Pflumm, Pietro Bortolotti, Marco Morandini (VABS verification and experimental validation)
