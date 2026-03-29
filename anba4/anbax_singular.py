@@ -1,531 +1,772 @@
-#
-# Copyright (C) 2018 Marco Morandini
-#
-#----------------------------------------------------------------------
-#
-#    This file is part of Anba.
-#
-#    Anba is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License as published by
-#    the Free Software Foundation, either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    Anba is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with Anba.  If not, see <https://www.gnu.org/licenses/>.
-#
-#----------------------------------------------------------------------
-#
+"""
+ANBA4-skfem singular solver: Cross-section analysis using sparse direct methods.
 
-from dolfin import *
-from petsc4py import PETSc
+Computes 6x6 stiffness and mass matrices of composite beam cross sections.
+This variant uses scipy's sparse direct solver (spsolve) which handles 
+singular systems through augmented system formulation.
+
+Theory: Morandini et al. (2010) "Characteristic behavior of prismatic
+anisotropic beam via generalized eigenvectors"
+
+Original ANBA4:
+    Copyright (C) 2018 Marco Morandini
+    https://github.com/manuelma/anba4
+
+scikit-fem port:
+    Copyright (C) 2024-2026 Basem Rajjoub
+
+Licensed under GNU GPL v3 - see COPYING file for details.
+"""
 
 import numpy as np
+from scipy.sparse import csr_matrix, lil_matrix
+from scipy.sparse.linalg import spsolve
+from scipy.linalg import solve, lstsq
 
-from anba4.voight_notation import stressVectorToStressTensor, \
-    stressTensorToStressVector, stressTensorToParaviewStressVector, \
-    strainVectorToStrainTensor, strainTensorToStrainVector, strainTensorToParaviewStrainVector
-from anba4 import material
+from skfem import *
+from skfem.helpers import grad, dot
 
-class anbax_singular():
-    def __init__(self, mesh, degree, matLibrary, materials, plane_orientations, fiber_orientations, scaling_constraint = 1.):
+from .material import Material
+
+
+class AnbaxSingular:
+    """
+    ANBA cross-section analyzer using scikit-fem with sparse direct solvers.
+    
+    This variant uses scipy's sparse direct solver (spsolve) with augmented
+    system formulation to handle the singular E matrix.
+
+    Based on the generalized eigenvector theory from Morandini et al. (2010).
+
+    Parameters
+    ----------
+    mesh : skfem.Mesh
+        2D mesh of the cross-section
+    degree : int
+        Polynomial degree (1 or 2)
+    mat_library : list of Material
+        Material objects
+    materials : array-like
+        Element material indices
+    plane_orientations : array-like
+        Element plane orientation angles (degrees)
+    fiber_orientations : array-like
+        Element fiber orientation angles (degrees)
+    scaling_constraint : float
+        Constraint scaling factor
+    """
+
+    def __init__(self, mesh, degree, mat_library, materials, plane_orientations,
+                 fiber_orientations, scaling_constraint=1.0):
         self.mesh = mesh
         self.degree = degree
-        self.matLibrary = matLibrary
-        self.materials = materials
-        self.fiber_orientations = fiber_orientations
-        self.plane_orientations = plane_orientations
-        self.modulus = CompiledExpression(
-            material.ElasticModulus(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.RotatedStress_modulus = CompiledExpression(
-            material.RotatedStressElasticModulus(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.MaterialRotation_matrix = CompiledExpression(
-            material.TransformationMatrix(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.density = CompiledExpression(
-            material.MaterialDensity(
-                self.matLibrary,
-                self.materials
-            ),
-            degree=0
-        )
+        self.mat_library = mat_library
+        self.materials = np.asarray(materials).flatten()
+        self.plane_orientations = np.asarray(plane_orientations).flatten()
+        self.fiber_orientations = np.asarray(fiber_orientations).flatten()
         self.scaling_constraint = scaling_constraint
+        self.n_elem = mesh.nelements
 
-        # Define function on space.
-        UF3_ELEMENT = VectorElement("CG", self.mesh.ufl_cell(), self.degree, 3)
-        self.UF3 = FunctionSpace(self.mesh, UF3_ELEMENT)
+        # Build material stiffness field
+        self._build_material_fields()
 
-        #Lagrange multipliers needed to compute the stress resultants and moment resultants
-        R3_ELEMENT = VectorElement("R", self.mesh.ufl_cell(), 0, 3)
-        self.R3 = FunctionSpace(self.mesh, R3_ELEMENT)
-        R3R3_ELEMENT = MixedElement(R3_ELEMENT, R3_ELEMENT)
-        self.R3R3 = FunctionSpace(self.mesh, R3R3_ELEMENT)
-        (self.RV3F, self.RV3M) = TestFunctions(self.R3R3)
-        (self.RT3F, self.RT3M) = TrialFunctions(self.R3R3)
+        # Create vector element (3 components for u1, u2, u3)
+        if isinstance(mesh, MeshTri):
+            scalar_elem = ElementTriP1() if degree == 1 else ElementTriP2()
+        else:
+            scalar_elem = ElementQuad1() if degree == 1 else ElementQuad2()
 
-        #STRESS_ELEMENT = TensorElement("DG", self.mesh.ufl_cell(), 0, (3, 3))
-        STRESS_ELEMENT = VectorElement("DG", self.mesh.ufl_cell(), 0, 6)
-        self.STRESS_FS = FunctionSpace(self.mesh, STRESS_ELEMENT)
-        self.STRESS = Function(self.STRESS_FS, name = "stress tensor")
-        self.STRAIN = Function(self.STRESS_FS, name = "strain tensor")
+        self.elem = ElementVector(scalar_elem, dim=3)
+        self.basis = Basis(mesh, self.elem)
+        self.n_dofs = self.basis.N
 
-        self.b = Function(self.UF3)
-        self.U = Function(self.UF3)
-        self.UP = Function(self.UF3)
-        self.UV = TestFunction(self.UF3)
-        self.UT = TrialFunction(self.UF3)
+        # Results storage
+        self._stiffness = None
+        self._mass = None
+        self._chains = None
+        self._E_mat = None
+        self._C_mat = None
+        self._M_mat = None
+        self._G_matrix = None
 
-        self.POS = MeshCoordinates(self.mesh)
+    def _build_material_fields(self):
+        """Pre-compute material stiffness for each element."""
+        self.C = np.zeros((self.n_elem, 6, 6))
+        self.rho = np.zeros(self.n_elem)
 
-        self.base_chains_expression = []
-        self.linear_chains_expression = []
-        self.Torsion = Expression(("-x[1]", "x[0]", "0."), element = self.UF3.ufl_element())
-        self.Flex_y = Expression(("0.", "0.", "-x[0]"), element = self.UF3.ufl_element())
-        self.Flex_x = Expression(("0.", "0.", "-x[1]"), element = self.UF3.ufl_element())
-
-        self.base_chains_expression.append(Constant((0., 0., 1.)))
-        self.base_chains_expression.append(self.Torsion)
-        self.base_chains_expression.append(Constant((1., 0., 0.)))
-        self.base_chains_expression.append(Constant((0., 1., 0.)))
-        self.linear_chains_expression.append(self.Flex_y)
-        self.linear_chains_expression.append(self.Flex_x)
-
-        self.chains = [[], [], [], []]
-        
-        # fill chains
-        for i in range(4):
-            for k in range(2):
-                self.chains[i].append(Function(self.UF3))
-        for i in range(2,4):
-            for k in range(2):
-                self.chains[i].append(Function(self.UF3))
-
-        # initialize constant chains
-        for i in range(4):
-            self.chains[i][0].interpolate(self.base_chains_expression[i])
-
-        # keep torsion independent from translation
-        for i in [0, 2, 3]:
-            k = (self.chains[1][0].vector().inner(self.chains[i][0].vector())) / (self.chains[i][0].vector().inner(self.chains[i][0].vector()))
-            self.chains[1][0].vector()[:] -= k * self.chains[i][0].vector()
-
-        tmpnorm = []
-        for i in range(4):
-            tmpnorm.append(self.chains[i][0].vector().norm("l2"))
-            self.chains[i][0].vector()[:] *= 1.0/tmpnorm[i]
-
-        self.null_space = VectorSpaceBasis([self.chains[i][0].vector() for i in range(4)])
-
-
-        # initialize linear chains
-        for i in range(2,4):
-            self.chains[i][1].interpolate(self.linear_chains_expression[i-2])
-            self.chains[i][1].vector()[:] *= 1.0/tmpnorm[i]
-            self.null_space.orthogonalize(self.chains[i][1].vector());
-        del tmpnorm
-#            for k in range(4):
-#	            c = (self.chains[i][1].vector().inner(self.chains[k][0].vector())) / (self.chains[k][0].vector().inner(self.chains[k][0].vector()))
-#	            self.chains[i][1].vector()[:] -= c * self.chains[k][0].vector()
+        for e in range(self.n_elem):
+            mat_id = int(self.materials[e])
+            alpha = self.plane_orientations[e]
+            beta = self.fiber_orientations[e]
+            mat = self.mat_library[mat_id]
+            self.C[e] = mat.compute_elastic_modulus(alpha, beta)
+            self.rho[e] = mat.rho
 
     def inertia(self):
-        Mf  = dot(self.RV3F, self.RT3F) * self.density[0] * dx
-        Mf -= dot(self.RV3F, cross(self.pos3d(self.POS), self.RT3M)) * self.density[0] * dx
-        Mf -= dot(cross(self.pos3d(self.POS), self.RV3M), self.RT3F) * self.density[0] * dx
-        Mf += dot(cross(self.pos3d(self.POS), self.RV3M), cross(self.pos3d(self.POS), self.RT3M)) * self.density[0] * dx
-        MM = assemble(Mf)
-        M = as_backend_type(MM).mat()
-        Mass = PETSc.Mat()#.createDense([6, 6])
-        #Mass.setUp()
-        #Mass.view()
-        #M.copy(Mass, PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
-        M.convert('dense', Mass)
-        return Mass
+        """
+        Compute 6x6 mass matrix.
+
+        Returns
+        -------
+        M : ndarray (6, 6)
+        """
+        mesh = self.mesh
+
+        # Compute mass properties by integration
+        m = 0.0
+        S2 = 0.0
+        S3 = 0.0
+        I22 = 0.0
+        I33 = 0.0
+        I23 = 0.0
+
+        for e in range(self.n_elem):
+            rho_e = self.rho[e]
+            if rho_e == 0:
+                continue
+
+            # Get element geometry
+            if isinstance(mesh, MeshTri):
+                elem_nodes = mesh.t[:, e]
+                coords = mesh.p[:, elem_nodes]
+                v1 = coords[:, 1] - coords[:, 0]
+                v2 = coords[:, 2] - coords[:, 0]
+                area = 0.5 * abs(v1[0]*v2[1] - v1[1]*v2[0])
+                xc = coords[0, :].mean()
+                yc = coords[1, :].mean()
+            else:
+                elem_nodes = mesh.t[:, e]
+                coords = mesh.p[:, elem_nodes]
+                x = coords[0, :]
+                y = coords[1, :]
+                area = 0.5 * abs(sum(x[i]*(y[(i+1)%4] - y[(i-1)%4]) for i in range(4)))
+                xc = x.mean()
+                yc = y.mean()
+
+            m += rho_e * area
+            S2 += rho_e * area * yc
+            S3 += rho_e * area * xc
+            I22 += rho_e * area * yc**2
+            I33 += rho_e * area * xc**2
+            I23 += rho_e * area * xc * yc
+
+        # Assemble 6x6 mass matrix
+        M = np.zeros((6, 6))
+
+        M[0, 0] = m
+        M[1, 1] = m
+        M[2, 2] = m
+
+        M[0, 5] = S2;  M[5, 0] = S2
+        M[1, 5] = -S3; M[5, 1] = -S3
+        M[2, 3] = -S2; M[3, 2] = -S2
+        M[2, 4] = S3;  M[4, 2] = S3
+
+        M[3, 3] = I22
+        M[4, 4] = I33
+        M[3, 4] = -I23
+        M[4, 3] = -I23
+        M[5, 5] = I22 + I33
+
+        self._mass = M
+        return M
 
     def compute(self):
-        stress = self.Sigma(self.U, self.UP)
-        stress_n = stress[:,2]
-        stress_1 = stress[:,0]
-        stress_2 = stress[:,1]
-        stress_s = as_tensor([[stress_1[0], stress_2[0]],
-            [stress_1[1], stress_2[1]],
-            [stress_1[2], stress_2[2]]])
+        """
+        Compute the 6x6 stiffness matrix using sparse direct solver.
 
-        eps = self.epsilon(self.U, self.UP)
+        Returns
+        -------
+        K : ndarray (6, 6)
+        """
+        # Assemble the key matrices
+        E_mat, C_mat, M_mat = self._assemble_matrices()
 
-        ES = derivative(stress, self.U, self.UT)
-        ES_t = derivative(stress_s, self.U, self.UT)
-        ES_n = derivative(stress_s, self.UP, self.UT)
-        En_t = derivative(stress_n, self.U, self.UT)
-        En_n = derivative(stress_n, self.UP, self.UT)
+        # Store matrices
+        self._E_mat = E_mat
+        self._C_mat = C_mat
+        self._M_mat = M_mat
 
-        Mf = inner(self.UV, En_n) * dx
-        self.M = assemble(Mf)
-        print("M norm ", as_backend_type(self.M).mat().norm())
+        # Compute stiffness using augmented system approach
+        K, chains = self._compute_stiffness_augmented(E_mat, C_mat, M_mat)
 
-        Cf = inner(grad(self.UV), ES_n) * dx
-        C = assemble(Cf)
-        Hf = (inner(grad(self.UV), ES_n) - inner(self.UV, En_t)) * dx
-        self.H = assemble(Hf)
-        print("H norm ", as_backend_type(self.H).mat().norm())
-
-
-        #the four initial solutions
-
-        Ef = inner(grad(self.UV), ES_t) * dx
-        self.E = assemble(Ef)
-        print("E norm ", as_backend_type(self.E).mat().norm())
-
-        solver = PETScKrylovSolver("cg")
-        solver.parameters["relative_tolerance"] = 1.E-10
-        solver.parameters["absolute_tolerance"] = 1.E-16
-        solver.parameters["convergence_norm_type"] = "natural"
-#        solver.parameters["monitor_convergence"] = True
-        solver.set_operator(self.E)
-        as_backend_type(self.E).set_nullspace(self.null_space)
-        ptn = PETSc.NullSpace([as_backend_type(self.chains[i][0].vector()).vec() for i in range(4)])
-        #as_backend_type(self.E).mat().setTransposeNullSpace(ptn)
-
-        S = dot(stress_n, self.RV3F) * dx + dot(cross(self.pos3d(self.POS), stress_n), self.RV3M) * dx
-        L_res_f = derivative(S, self.UP, self.UT)
-        self.L_res = assemble(L_res_f)
-        R_res_f = derivative(S, self.U, self.UT)
-        self.R_res = assemble(R_res_f)
-                
-        maxres = 0.
-        for i in range(4):
-            tmp = self.E*self.chains[i][0].vector()
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
-        for i in [2, 3]:
-            tmp = -(self.H*self.chains[i][0].vector()) -(self.E * self.chains[i][1].vector())
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
+        # Store chains for field recovery
+        self._chains = chains
+        self._stiffness = K
         
-#        if maxres > 1.E-16:
-#            scaling_factor = 1.E-16 / maxres;
-#        else:
-#            scaling_factor = 1.
+        # Build G matrix for stress/strain recovery
+        self._build_g_matrix()
+        
+        return K
 
-#        for i in range(4):
-#            self.chains[i][0].vector()[:] = self.chains[i][0].vector() * scaling_factor
-#        for i in [2, 3]:
-#            self.chains[i][1].vector()[:] = self.chains[i][1].vector() * scaling_factor
+    def _get_quadrature(self):
+        """Get quadrature points and weights."""
+        if isinstance(self.mesh, MeshTri):
+            qp_ref = np.array([[1/6, 1/6], [2/3, 1/6], [1/6, 2/3]]).T
+            qw = np.array([1/6, 1/6, 1/6])
+        else:
+            g = 1/np.sqrt(3)
+            qp_ref = np.array([[-g, -g], [g, -g], [g, g], [-g, g]]).T
+            qw = np.array([1, 1, 1, 1])
+        return qp_ref, qw
+
+    def _get_shape_functions(self, xi):
+        """Get shape functions and derivatives at reference point xi."""
+        if isinstance(self.mesh, MeshTri):
+            if self.degree == 1:
+                N = np.array([1 - xi[0] - xi[1], xi[0], xi[1]])
+                dN_dxi = np.array([[-1, 1, 0], [-1, 0, 1]])
+            else:
+                L1, L2, L3 = 1 - xi[0] - xi[1], xi[0], xi[1]
+                N = np.array([L1*(2*L1-1), L2*(2*L2-1), L3*(2*L3-1),
+                             4*L1*L2, 4*L2*L3, 4*L3*L1])
+                dN_dxi = np.array([
+                    [-(4*L1-1), 4*L2-1, 0, 4*(L1-L2), 4*L3, -4*L3],
+                    [-(4*L1-1), 0, 4*L3-1, -4*L2, 4*L2, 4*(L1-L3)]
+                ])
+        else:
+            if self.degree == 1:
+                N = 0.25 * np.array([(1-xi[0])*(1-xi[1]), (1+xi[0])*(1-xi[1]),
+                                    (1+xi[0])*(1+xi[1]), (1-xi[0])*(1+xi[1])])
+                dN_dxi = 0.25 * np.array([
+                    [-(1-xi[1]), (1-xi[1]), (1+xi[1]), -(1+xi[1])],
+                    [-(1-xi[0]), -(1+xi[0]), (1+xi[0]), (1-xi[0])]
+                ])
+            else:
+                raise NotImplementedError("Quadratic quads not implemented")
+        return N, dN_dxi
+
+    def _get_geom_shape_functions(self, xi):
+        """Get geometry shape functions for Jacobian computation."""
+        if isinstance(self.mesh, MeshTri):
+            N_geom = np.array([1 - xi[0] - xi[1], xi[0], xi[1]])
+            dN_geom_dxi = np.array([[-1, 1, 0], [-1, 0, 1]])
+        else:
+            N_geom = 0.25 * np.array([(1-xi[0])*(1-xi[1]), (1+xi[0])*(1-xi[1]),
+                                      (1+xi[0])*(1+xi[1]), (1-xi[0])*(1+xi[1])])
+            dN_geom_dxi = 0.25 * np.array([
+                [-(1-xi[1]), (1-xi[1]), (1+xi[1]), -(1+xi[1])],
+                [-(1-xi[0]), -(1+xi[0]), (1+xi[0]), (1-xi[0])]
+            ])
+        return N_geom, dN_geom_dxi
+
+    def _assemble_matrices(self):
+        """Assemble E, C, M matrices (same as Anbax)."""
+        basis = self.basis
+        elem_dofs = basis.element_dofs
+        n_dofs = self.n_dofs
+
+        E_mat = lil_matrix((n_dofs, n_dofs))
+        C_mat = lil_matrix((n_dofs, n_dofs))
+        M_mat = lil_matrix((n_dofs, n_dofs))
+
+        qp_ref, qw = self._get_quadrature()
+
+        if isinstance(self.mesh, MeshTri):
+            n_sf_nodes = 3 if self.degree == 1 else 6
+        else:
+            n_sf_nodes = 4 if self.degree == 1 else 9
+
+        for e in range(self.n_elem):
+            Ce = self.C[e]
+
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+
+            dofs = elem_dofs[:, e]
+            n_local = len(dofs)
+
+            Ee = np.zeros((n_local, n_local))
+            Ce_local = np.zeros((n_local, n_local))
+            Me = np.zeros((n_local, n_local))
+
+            for qp_idx in range(len(qw)):
+                xi = qp_ref[:, qp_idx]
+                w = qw[qp_idx]
+
+                _, dN_geom_dxi = self._get_geom_shape_functions(xi)
+                J = dN_geom_dxi @ coords.T
+                detJ = abs(np.linalg.det(J))
+                invJ = np.linalg.inv(J)
+
+                N, dN_dxi = self._get_shape_functions(xi)
+                dN_dx = invJ @ dN_dxi
+
+                for i in range(n_local):
+                    node_i = i // 3
+                    comp_i = i % 3
+
+                    if node_i >= n_sf_nodes:
+                        continue
+
+                    eps_s_i = np.zeros(6)
+                    if comp_i == 0:
+                        eps_s_i[5] = dN_dx[0, node_i]
+                        eps_s_i[4] = dN_dx[1, node_i]
+                    elif comp_i == 1:
+                        eps_s_i[1] = dN_dx[0, node_i]
+                        eps_s_i[3] = dN_dx[1, node_i]
+                    else:
+                        eps_s_i[2] = dN_dx[1, node_i]
+                        eps_s_i[3] = dN_dx[0, node_i]
+
+                    eps_n_i = np.zeros(6)
+                    N_i = N[node_i]
+                    if comp_i == 0:
+                        eps_n_i[0] = N_i
+                    elif comp_i == 1:
+                        eps_n_i[5] = N_i
+                    else:
+                        eps_n_i[4] = N_i
+
+                    for j in range(n_local):
+                        node_j = j // 3
+                        comp_j = j % 3
+
+                        if node_j >= n_sf_nodes:
+                            continue
+
+                        eps_s_j = np.zeros(6)
+                        if comp_j == 0:
+                            eps_s_j[5] = dN_dx[0, node_j]
+                            eps_s_j[4] = dN_dx[1, node_j]
+                        elif comp_j == 1:
+                            eps_s_j[1] = dN_dx[0, node_j]
+                            eps_s_j[3] = dN_dx[1, node_j]
+                        else:
+                            eps_s_j[2] = dN_dx[1, node_j]
+                            eps_s_j[3] = dN_dx[0, node_j]
+
+                        eps_n_j = np.zeros(6)
+                        N_j = N[node_j]
+                        if comp_j == 0:
+                            eps_n_j[0] = N_j
+                        elif comp_j == 1:
+                            eps_n_j[5] = N_j
+                        else:
+                            eps_n_j[4] = N_j
+
+                        Ee[i, j] += eps_s_i @ Ce @ eps_s_j * detJ * w
+                        Ce_local[i, j] += eps_s_i @ Ce @ eps_n_j * detJ * w
+                        Me[i, j] += eps_n_i @ Ce @ eps_n_j * detJ * w
+
+            for i, di in enumerate(dofs):
+                for j, dj in enumerate(dofs):
+                    E_mat[di, dj] += Ee[i, j]
+                    C_mat[di, dj] += Ce_local[i, j]
+                    M_mat[di, dj] += Me[i, j]
+
+        return E_mat.tocsr(), C_mat.tocsr(), M_mat.tocsr()
+
+    def _compute_stiffness_augmented(self, E_mat, C_mat, M_mat):
+        """
+        Compute 6x6 stiffness using augmented system formulation.
+        
+        This handles the singular E matrix by augmenting with nullspace constraints.
+        """
+        n_dofs = self.n_dofs
+        basis = self.basis
+
+        # Get DOF coordinates
+        doflocs = basis.doflocs
+        x2 = doflocs[0, :]
+        x3 = doflocs[1, :]
+        comp = np.arange(n_dofs) % 3
+
+        # Convert to dense for some operations
+        E_dense = E_mat.toarray()
+        C_dense = C_mat.toarray()
+        M_dense = M_mat.toarray()
+        H_dense = C_dense - C_dense.T
+
+        # Initialize the 4 rigid body modes (nullspace of E)
+        d0_axial = np.zeros(n_dofs)
+        d0_axial[comp == 0] = 1.0
+
+        d0_torsion = np.zeros(n_dofs)
+        d0_torsion[comp == 1] = -x3[comp == 1]
+        d0_torsion[comp == 2] = x2[comp == 2]
+
+        d0_shear2 = np.zeros(n_dofs)
+        d0_shear2[comp == 1] = 1.0
+
+        d0_shear3 = np.zeros(n_dofs)
+        d0_shear3[comp == 2] = 1.0
+
+        d0_list = [d0_axial, d0_torsion, d0_shear2, d0_shear3]
+
+        # Build nullspace basis matrix
+        Phi = np.column_stack(d0_list)
+
+        def solve_constrained(A, b):
+            """Solve singular system A x = b with nullspace constraints."""
+            n = A.shape[0]
+            nc = Phi.shape[1]
+
+            # Build augmented system
+            A_aug = np.zeros((n + nc, n + nc))
+            A_aug[:n, :n] = A
+            A_aug[:n, n:] = Phi
+            A_aug[n:, :n] = Phi.T
+
+            b_aug = np.zeros(n + nc)
+            b_aug[:n] = b
+
+            # Add small regularization
+            A_aug[:n, :n] += 1e-12 * np.eye(n)
+
+            try:
+                sol = solve(A_aug, b_aug)
+                return sol[:n]
+            except np.linalg.LinAlgError:
+                sol, _, _, _ = lstsq(A_aug, b_aug)
+                return sol[:n]
+
+        def project_out_null(v):
+            """Project out nullspace components."""
+            v = v.copy()
+            for d0 in d0_list:
+                norm_sq = np.dot(d0, d0)
+                if norm_sq > 1e-14:
+                    v = v - (np.dot(v, d0) / norm_sq) * d0
+            return v
+
+        # Initialize chains
+        chains = [[], [], [], []]
+
+        # Fill chains with initial vectors
         for i in range(4):
-            tmp = self.E*self.chains[i][0].vector()
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
-        for i in [2, 3]:
-            tmp = -(self.H*self.chains[i][0].vector()) -(self.E * self.chains[i][1].vector())
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
+            chains[i].append(d0_list[i])
 
-        resk = []
-        # solve E d1 = -H d0
+        # Add linear chains for bending (indices 2 and 3)
+        d1_bend2 = np.zeros(n_dofs)
+        d1_bend2[comp == 0] = -x2[comp == 0]
+        d1_bend2 = project_out_null(d1_bend2)
+        chains[2].append(d1_bend2)
+
+        d1_bend3 = np.zeros(n_dofs)
+        d1_bend3[comp == 0] = -x3[comp == 0]
+        d1_bend3 = project_out_null(d1_bend3)
+        chains[3].append(d1_bend3)
+
+        # Solve E d1 = -H d0 for chains 0 and 1 (axial and torsion)
         for i in range(2):
-            self.b.vector()[:] = -(self.H*self.chains[i][0].vector())
-            self.null_space.orthogonalize(self.b.vector());
-            print('Solving ',i)
-            solver.solve(self.E, self.chains[i][1].vector(), self.b.vector())
-            self.null_space.orthogonalize(self.chains[i][1].vector());
-#            for k in range(4):
-#                c = (self.chains[i][1].vector().inner(self.chains[k][0].vector())) / (self.chains[k][0].vector().inner(self.chains[k][0].vector()))
-#                self.chains[i][1].vector()[:] -= c * self.chains[k][0].vector()
-            res = -(self.H*self.chains[i][1].vector())+(self.M*self.chains[i][0].vector())
-            resk.append(res.inner(self.chains[i][0].vector()))
+            rhs = -H_dense @ chains[i][0]
+            rhs = project_out_null(rhs)
+            d1 = solve_constrained(E_dense, rhs)
+            chains[i].append(project_out_null(d1))
 
-        # solve E d2 = M d0 - H d1
+        # Solve E d2 = M d0 - H d1 for chains 2 and 3 (bending)
         for i in [2, 3]:
-            self.b.vector()[:] = -(self.H*self.chains[i][1].vector())+(self.M*self.chains[i][0].vector())
-#             self.null_space.orthogonalize(self.b.vector());
-            print('Solving ',i,0)
-            solver.solve(self.E, self.chains[i][2].vector(), self.b.vector())
+            rhs = M_dense @ chains[i][0] - H_dense @ chains[i][1]
+            rhs = project_out_null(rhs)
+            d2 = solve_constrained(E_dense, rhs)
+            chains[i].append(project_out_null(d2))
 
+        # Correction step for bending chains
+        a = np.zeros((2, 2))
+        b = np.zeros(2)
 
-
-        a = np.zeros((2,2))
-        b = np.zeros((2,1))
         for i in [2, 3]:
-            self.b.vector()[:] = -(self.H*self.chains[i][2].vector())+(self.M*self.chains[i][1].vector())
-            for k in range(4):
-                print(self.b.vector().inner(self.chains[k][0].vector()))        
-        for i in [2, 3]:
-            self.b.vector()[:] = -(self.H*self.chains[i][2].vector())+(self.M*self.chains[i][1].vector())
-            for k in range(2):
-                b[k] = self.b.vector().inner(self.chains[k][0].vector())
-                for ii in range(2):
-                    #a[ii, k] = (-(H*self.chains[ii][0].vector())).inner(self.chains[k][0].vector()) / normk
-                    a[k, ii] = (-(self.H*self.chains[ii][1].vector())+(self.M*self.chains[ii][0].vector())).inner(self.chains[k][0].vector())
-            x = np.linalg.solve(a, b)
+            res = M_dense @ chains[i][1] - H_dense @ chains[i][2]
+
+            b[0] = np.dot(res, chains[0][0])
+            b[1] = np.dot(res, chains[1][0])
+
             for ii in range(2):
-                self.chains[i][2].vector()[:] -= x[ii] * self.chains[ii][1].vector()
-                self.chains[i][1].vector()[:] -= x[ii] * self.chains[ii][0].vector()
-        #asd
-        
+                vec = M_dense @ chains[ii][0] - H_dense @ chains[ii][1]
+                a[0, ii] = np.dot(vec, chains[0][0])
+                a[1, ii] = np.dot(vec, chains[1][0])
+
+            if np.linalg.cond(a) < 1e12:
+                x = np.linalg.solve(a, b)
+                chains[i][2] = chains[i][2] - x[0] * chains[0][1] - x[1] * chains[1][1]
+                chains[i][1] = chains[i][1] - x[0] * chains[0][0] - x[1] * chains[1][0]
+
+        # Solve E d3 = M d1 - H d2 for chains 2 and 3
         for i in [2, 3]:
-            print('Solving ',i,1)
-            self.b.vector()[:] = -(self.H*self.chains[i][2].vector())+(self.M*self.chains[i][1].vector())
-            pippo = as_backend_type(self.b.vector()).vec()
-            print("Residual ", i, "norm ", pippo.dot(pippo))
-            solver.solve(self.E, self.chains[i][3].vector(), self.b.vector())
-            self.null_space.orthogonalize(self.chains[i][3].vector());
-            for k in range(4):
-                c = (self.chains[i][3].vector().inner(self.chains[k][0].vector())) / (self.chains[k][0].vector().inner(self.chains[k][0].vector()))
-                self.chains[i][3].vector()[:] -= c * self.chains[k][0].vector()
+            rhs = M_dense @ chains[i][1] - H_dense @ chains[i][2]
+            rhs = project_out_null(rhs)
+            d3 = solve_constrained(E_dense, rhs)
+            chains[i].append(project_out_null(d3))
 
-        # solve E d3 = M d1 - H d2
-        for i in range(4):
-            print("\nChain "+ str(i) +":")
-            for k in range(len(self.chains[i])//2, len(self.chains[i])):
-                print("(row" + str(k) + ") = ", assemble(inner(self.chains[i][k], self.chains[i][k]) * dx))
+        # Compute stiffness matrix
+        def stiffness_term(da, db):
+            return (da @ M_dense @ da + da @ C_dense.T @ db +
+                    db @ C_dense @ da + db @ E_dense @ db)
 
-        print("")
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                res =  self.E * self.chains[i][ll-k].vector() + self.H * self.chains[i][ll-1-k].vector()
-                if ll-1-k > 0:
-                    res -= self.M * self.chains[i][ll-2-k].vector()
-                res = as_backend_type(res).vec()
-                print('residual chain',i,'order',ll-k, res.dot(res))
-        print("")
+        def cross_stiffness(da_i, db_i, da_j, db_j):
+            return (da_i @ M_dense @ da_j + da_i @ C_dense.T @ db_j +
+                    db_i @ C_dense @ da_j + db_i @ E_dense @ db_j)
 
+        K = np.zeros((6, 6))
 
-        row1_col = []
-        row2_col = []
-        for i in range(6):
-            row1_col.append(as_backend_type(self.chains[0][0].vector().copy()).vec())
-            row2_col.append(as_backend_type(self.chains[0][0].vector().copy()).vec())
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]
+        d0_3, d1_3, d2_3, d3_3 = chains[3]
 
-        M_p = as_backend_type(self.M).mat()
-        C_p = as_backend_type(C).mat()
-        E_p = as_backend_type(self.E).mat()
-        S = PETSc.Mat().createDense([6, 6])
-        S.setUp()
+        # Diagonal terms
+        K[2, 2] = stiffness_term(d0_ax, d1_ax)
+        K[5, 5] = stiffness_term(d0_tor, d1_tor)
+        K[4, 4] = stiffness_term(d1_2, d2_2)
+        K[0, 0] = 0.75 * stiffness_term(d0_2, d2_2)
+        K[3, 3] = stiffness_term(d1_3, d2_3)
+        K[1, 1] = 0.75 * stiffness_term(d0_3, d2_3)
 
-        self.B = PETSc.Mat().createDense([6, 6])
-        self.B.setUp()
+        # Cross terms
+        K[2, 5] = cross_stiffness(d0_ax, d1_ax, d0_tor, d1_tor)
+        K[5, 2] = K[2, 5]
+        K[3, 4] = cross_stiffness(d1_3, d2_3, d1_2, d2_2)
+        K[4, 3] = K[3, 4]
+        K[0, 1] = 0.75 * cross_stiffness(d0_2, d2_2, d0_3, d2_3)
+        K[1, 0] = K[0, 1]
 
-        G = PETSc.Mat().createDense([6, 6])
-        G.setUp()
+        return K, chains
 
-        g = PETSc.Vec().createMPI(6)
-        b = PETSc.Vec().createMPI(6)
-
-        Stiff = PETSc.Mat().createDense([6, 6])
-        Stiff.setUp()
-
-
-
-        col = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                col = col + 1
-                M_p.mult(as_backend_type(self.chains[i][ll-1-k].vector()).vec(), row1_col[col])
-                C_p.multTransposeAdd(as_backend_type(self.chains[i][ll-k].vector()).vec(), row1_col[col], row1_col[col])
-                C_p.mult(as_backend_type(self.chains[i][ll-1-k].vector()).vec(), row2_col[col])
-                E_p.multAdd(as_backend_type(self.chains[i][ll-k].vector()).vec(), row2_col[col], row2_col[col])
-
-
-        #print dir(PETSc.Vec)
-
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                for c in range(6):
-                    S.setValues(row, c, as_backend_type(self.chains[i][ll-1-k].vector()).vec().dot(row1_col[c]) +
-                        as_backend_type(self.chains[i][ll-k].vector()).vec().dot(row2_col[c]))
-                self.B.setValues(row, range(6), as_backend_type(self.L_res * self.chains[i][ll-1-k].vector() + self.R_res * self.chains[i][ll-k].vector()).vec())
-
-        S.assemble()
-        self.B.assemble()
-
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(S)
-
-
-        for i in range(6):
-            ksp.solve(self.B.getColumnVector(i), g)
-            G.setValues(range(6), i, g)
-
-        G.assemble()
-
-        G.transposeMatMult(S, self.B)
-        self.B.matMult(G, Stiff)
+    def _build_g_matrix(self):
+        """Build G matrix for stress/strain recovery."""
+        if self._chains is None or self._stiffness is None:
+            raise RuntimeError("Must call compute() before building G matrix")
         
-        return Stiff
+        K = self._stiffness
         
-    def Sigma(self, u, up):
-        "Return second Piola–Kirchhoff stress tensor."
-        return self.sigma_helper(u, up, self.modulus)
+        try:
+            self._G_matrix = np.linalg.inv(K)
+        except np.linalg.LinAlgError:
+            self._G_matrix = np.linalg.lstsq(K, np.eye(6), rcond=None)[0]
 
-    def RotatedSigma(self, u, up):
-        "Return second Piola–Kirchhoff stress tensor."
-        return self.sigma_helper(u, up, self.RotatedStress_modulus)
+    def stress_field(self, force, moment, reference="local", voigt_convention="anba"):
+        """
+        Compute stress field distribution for given force/moment resultants.
 
-    def sigma_helper(self, u, up, mod):
-        "Return second Piola–Kirchhoff stress tensor."
-        et = self.epsilon(u, up)
-        ev = strainTensorToStrainVector(et)
-#         elasticMatrix = self.modulus
-        elasticMatrix = as_matrix(((mod[0],mod[1],mod[2],mod[3],mod[4],mod[5]),\
-                                   (mod[6],mod[7],mod[8],mod[9],mod[10],mod[11]),\
-                                   (mod[12],mod[13],mod[14],mod[15],mod[16],mod[17]),\
-                                   (mod[18],mod[19],mod[20],mod[21],mod[22],mod[23]),\
-                                   (mod[24],mod[25],mod[26],mod[27],mod[28],mod[29]),\
-                                   (mod[30],mod[31],mod[32],mod[33],mod[34],mod[35])))
-        sv = elasticMatrix * ev
-        st = stressVectorToStressTensor(sv)
-        return st
+        Parameters
+        ----------
+        force : array-like (3,)
+            Force resultants [F1, F2, F3] (axial, shear x2, shear x3)
+        moment : array-like (3,)
+            Moment resultants [M1, M2, M3] (torsion, bending x2, bending x3)
+        reference : str
+            "local" for material coordinates, "global" for section coordinates
+        voigt_convention : str
+            "anba" for ANBA ordering, "paraview" for ParaView ordering
 
-    def epsilon(self, u, up):
-        "Return symmetric 3D infinitesimal strain tensor."
-        return 0.5*(self.grad3d(u, up).T + self.grad3d(u, up))
-
-    def rotated_epsilon(self, u, up):
-        "Return symmetric 3D infinitesimal strain tensor rotated into material reference."
-        eps = self.epsilon(u, up)
-        rot = self.MaterialRotation_matrix
-        rotMatrix = as_matrix(((    rot[0], rot[1], rot[2], rot[3], rot[4], rot[5]),\
-                                   (rot[6], rot[7], rot[8], rot[9], rot[10],rot[11]),\
-                                   (rot[12],rot[13],rot[14],rot[15],rot[16],rot[17]),\
-                                   (rot[18],rot[19],rot[20],rot[21],rot[22],rot[23]),\
-                                   (rot[24],rot[25],rot[26],rot[27],rot[28],rot[29]),\
-                                   (rot[30],rot[31],rot[32],rot[33],rot[34],rot[35])))
-        roteps = strainVectorToStrainTensor(rotMatrix.T * strainTensorToStrainVector(eps))
-        return roteps
-
-    def grad3d(self, u, up):
-        "Return 3d gradient."
-        g = grad(u)
-        return as_tensor([[g[0,0], g[0,1], up[0]],[g[1,0], g[1,1], up[1]],[g[2,0], g[2,1], up[2]]])
-
-    def pos3d(self, POS):
-        "Return node coordinates Vector."
-        return as_vector([POS[0], POS[1], 0.])
-
-    def local_project(self, v, V, u=None):
-        """Element-wise projection using LocalSolver"""
-        dv = TrialFunction(V)
-        v_ = TestFunction(V)
-        a_proj = inner(dv, v_)*dx
-        b_proj = inner(v, v_)*dx
-        solver = LocalSolver(a_proj, b_proj)
-        solver.factorize()
-        if u is None:
-            u = Function(V)
-            solver.solve_local_rhs(u)
-            return u
-        else:
-            solver.solve_local_rhs(u)
-            return
-
-    def stress_field(self, force, moment, reference = "local", voigt_convention = "anba"):
-        if reference == "local":
-            stress_comp = self.RotatedSigma
-        elif reference == "global":
-            stress_comp = self.Sigma
-        else:
-            raise ValueError('reference argument should be equal to either to\"local\" or to "global", got \"' + reference + '\" instead')
-        if voigt_convention == "anba":
-            vector_conversion = stressTensorToStressVector
-        elif voigt_convention == "paraview":
-            vector_conversion = stressTensorToParaviewStressVector
-        else:
-            raise ValueError('voigt_convention argument should be equal to either to\"anba\" or to "paraview", got \"' + voigt_convention + '\" instead')
-
-        eigensol_magnitudes = PETSc.Vec().createMPI(6)
-
-        AzInt = PETSc.Vec().createMPI(6)
-
-        AzInt.setValues(range(3), force)
-        AzInt.setValues(range(3, 6), moment)
-        AzInt.assemblyBegin()
-        AzInt.assemblyEnd()
+        Returns
+        -------
+        stress : ndarray (n_elem, 6)
+            Stress vectors at element centers in Voigt notation
+        """
+        if self._chains is None:
+            raise RuntimeError("Must call compute() before stress_field()")
         
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(self.B)
-        ksp.setType(ksp.Type.PREONLY)   # Just use the preconditioner without a Krylov method
-        pc = ksp.getPC()                # Preconditioner
-        pc.setType(pc.Type.LU)          # Use a direct solve
+        force = np.asarray(force)
+        moment = np.asarray(moment)
         
-        ksp.solve(AzInt, eigensol_magnitudes)
+        # ANBA convention: [V2, V3, N, M2, M3, T]
+        AzInt = np.array([force[1], force[2], force[0], moment[1], moment[2], moment[0]])
         
-        self.U.vector()[:] = 0.
-        self.UP.vector()[:] = 0.
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                self.U.vector()[:] += self.chains[i][ll-k].vector() * eigensol_magnitudes[row]
-                self.UP.vector()[:] += self.chains[i][ll-1-k].vector() * eigensol_magnitudes[row]
-        self.local_project(vector_conversion(stress_comp(self.U, self.UP)), self.STRESS.ufl_function_space(), self.STRESS)
-#        self.local_project(stress_comp(self.U, self.UP), self.STRESS.ufl_function_space(), self.STRESS)
+        if self._G_matrix is None:
+            self._build_g_matrix()
+        
+        magnitudes = self._G_matrix @ AzInt
+        
+        # Reconstruct displacement fields
+        U = np.zeros(self.n_dofs)
+        UP = np.zeros(self.n_dofs)
+        
+        chains = self._chains
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]
+        d0_3, d1_3, d2_3, d3_3 = chains[3]
+        
+        chain_pairs = [
+            (d0_2, d2_2),
+            (d0_3, d2_3),
+            (d0_ax, d1_ax),
+            (d1_3, d2_3),
+            (d1_2, d2_2),
+            (d0_tor, d1_tor),
+        ]
+        
+        for i, (da, db) in enumerate(chain_pairs):
+            U += da * magnitudes[i]
+            UP += db * magnitudes[i]
+        
+        # Compute stress at element centers
+        stress = np.zeros((self.n_elem, 6))
+        
+        for e in range(self.n_elem):
+            Ce = self.C[e]
+            
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+            xc = coords[0, :].mean()
+            yc = coords[1, :].mean()
+            
+            dofs = self.basis.element_dofs[:, e]
+            U_e = U[dofs]
+            UP_e = UP[dofs]
+            
+            eps = self._compute_strain_at_element_center(e, U_e, UP_e, xc, yc, magnitudes)
+            sigma = Ce @ eps
+            
+            if reference == "global":
+                mat_id = int(self.materials[e])
+                alpha = self.plane_orientations[e]
+                beta = self.fiber_orientations[e]
+                mat = self.mat_library[mat_id]
+                T = mat.transformation_matrix(alpha, beta)
+                sigma = T @ sigma
+            
+            if voigt_convention == "paraview":
+                sigma = np.array([sigma[0], sigma[1], sigma[2], sigma[5], sigma[3], sigma[4]])
+            
+            stress[e] = sigma
+        
+        return stress
 
-    def strain_field(self, force, moment, reference = "local", voigt_convention = "anba"):
-        if reference == "local":
-            strain_comp = self.rotated_epsilon
-        elif reference == "global":
-            strain_comp = self.epsilon
+    def strain_field(self, force, moment, reference="local", voigt_convention="anba"):
+        """
+        Compute strain field distribution for given force/moment resultants.
+
+        Parameters
+        ----------
+        force : array-like (3,)
+            Force resultants [F1, F2, F3]
+        moment : array-like (3,)
+            Moment resultants [M1, M2, M3]
+        reference : str
+            "local" or "global"
+        voigt_convention : str
+            "anba" or "paraview"
+
+        Returns
+        -------
+        strain : ndarray (n_elem, 6)
+            Strain vectors at element centers in Voigt notation
+        """
+        if self._chains is None:
+            raise RuntimeError("Must call compute() before strain_field()")
+        
+        force = np.asarray(force)
+        moment = np.asarray(moment)
+        
+        AzInt = np.array([force[1], force[2], force[0], moment[1], moment[2], moment[0]])
+        
+        if self._G_matrix is None:
+            self._build_g_matrix()
+        
+        magnitudes = self._G_matrix @ AzInt
+        
+        U = np.zeros(self.n_dofs)
+        UP = np.zeros(self.n_dofs)
+        
+        chains = self._chains
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]
+        d0_3, d1_3, d2_3, d3_3 = chains[3]
+        
+        chain_pairs = [
+            (d0_2, d2_2),
+            (d0_3, d2_3),
+            (d0_ax, d1_ax),
+            (d1_3, d2_3),
+            (d1_2, d2_2),
+            (d0_tor, d1_tor),
+        ]
+        
+        for i, (da, db) in enumerate(chain_pairs):
+            U += da * magnitudes[i]
+            UP += db * magnitudes[i]
+        
+        strain = np.zeros((self.n_elem, 6))
+        
+        for e in range(self.n_elem):
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+            xc = coords[0, :].mean()
+            yc = coords[1, :].mean()
+            
+            dofs = self.basis.element_dofs[:, e]
+            U_e = U[dofs]
+            UP_e = UP[dofs]
+            
+            eps = self._compute_strain_at_element_center(e, U_e, UP_e, xc, yc, magnitudes)
+            
+            if reference == "local":
+                mat_id = int(self.materials[e])
+                alpha = self.plane_orientations[e]
+                beta = self.fiber_orientations[e]
+                mat = self.mat_library[mat_id]
+                T = mat.transformation_matrix(alpha, beta)
+                eps = T.T @ eps
+            
+            if voigt_convention == "paraview":
+                eps = np.array([eps[0], eps[1], eps[2], eps[5], eps[3], eps[4]])
+            
+            strain[e] = eps
+        
+        return strain
+
+    def _compute_strain_at_element_center(self, e, U_e, UP_e, xc, yc, generalized_strains=None):
+        """Compute strain vector at element center."""
+        if generalized_strains is not None:
+            eps = np.zeros(6)
+            eps[0] = generalized_strains[2] + generalized_strains[3] * yc - generalized_strains[4] * xc
+            eps[5] = generalized_strains[0] - generalized_strains[5] * yc
+            eps[4] = generalized_strains[1] + generalized_strains[5] * xc
+            return eps
+        
+        # Fallback to displacement-based computation
+        if isinstance(self.mesh, MeshTri):
+            xi_center = np.array([1/3, 1/3])
         else:
-            raise ValueError('reference argument should be equal to either to\"local\" or to "global", got \"' + reference + '\" instead')
-        if voigt_convention == "anba":
-            vector_conversion = strainTensorToStrainVector
-        elif voigt_convention == "paraview":
-            vector_conversion = strainTensorToParaviewStrainVector
+            xi_center = np.array([0.0, 0.0])
+        
+        N, dN_dxi = self._get_shape_functions(xi_center)
+        _, dN_geom_dxi = self._get_geom_shape_functions(xi_center)
+        
+        geom_nodes = self.mesh.t[:, e]
+        coords = self.mesh.p[:, geom_nodes]
+        
+        J = dN_geom_dxi @ coords.T
+        detJ = abs(np.linalg.det(J))
+        invJ = np.linalg.inv(J)
+        
+        dN_dx = invJ @ dN_dxi
+        
+        if isinstance(self.mesh, MeshTri):
+            n_sf_nodes = 3 if self.degree == 1 else 6
         else:
-            raise ValueError('voigt_convention argument should be equal to either to\"anba\" or to "paraview", got \"' + voigt_convention + '\" instead')
-
-        eigensol_magnitudes = PETSc.Vec().createMPI(6)
-
-        AzInt = PETSc.Vec().createMPI(6)
-
-        AzInt.setValues(range(3), force)
-        AzInt.setValues(range(3, 6), moment)
-        AzInt.assemblyBegin()
-        AzInt.assemblyEnd()
-
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(self.B)
-        ksp.setType(ksp.Type.PREONLY)   # Just use the preconditioner without a Krylov method
-        pc = ksp.getPC()                # Preconditioner
-        pc.setType(pc.Type.LU)          # Use a direct solve
-        ksp.solve(AzInt, eigensol_magnitudes)
-
-        self.U.vector()[:] = 0.
-        self.UP.vector()[:] = 0.
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                self.U.vector()[:] += self.chains[i][ll-k].vector() * eigensol_magnitudes[row]
-                self.UP.vector()[:] += self.chains[i][ll-1-k].vector() * eigensol_magnitudes[row]
-        self.local_project(vector_conversion(strain_comp(self.U, self.UP)), self.STRAIN.ufl_function_space(), self.STRAIN)
-#        self.local_project(stress_comp(self.U, self.UP), self.STRESS.ufl_function_space(), self.STRESS)
+            n_sf_nodes = 4 if self.degree == 1 else 9
+        
+        eps = np.zeros(6)
+        
+        n_local = len(U_e)
+        for i in range(n_local):
+            node_i = i // 3
+            comp_i = i % 3
+            
+            if node_i >= n_sf_nodes:
+                continue
+            
+            if comp_i == 0:
+                eps[5] += dN_dx[0, node_i] * U_e[i]
+                eps[4] += dN_dx[1, node_i] * U_e[i]
+            elif comp_i == 1:
+                eps[1] += dN_dx[0, node_i] * U_e[i]
+                eps[3] += dN_dx[1, node_i] * U_e[i]
+            else:
+                eps[2] += dN_dx[1, node_i] * U_e[i]
+                eps[3] += dN_dx[0, node_i] * U_e[i]
+            
+            if comp_i == 0:
+                eps[0] += N[node_i] * UP_e[i]
+            elif comp_i == 1:
+                eps[5] += N[node_i] * UP_e[i]
+            else:
+                eps[4] += N[node_i] * UP_e[i]
+        
+        return eps

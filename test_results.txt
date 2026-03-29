@@ -1,0 +1,47 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Admin\AppData\Local\Programs\Python\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Admin\Desktop\programming\anba4_pure_python
+configfile: setup.cfg
+plugins: anyio-4.12.1, napari-0.6.6, napari-plugin-engine-0.2.0, npe2-0.7.9, zarr-3.1.5
+collecting ... collected 4 items
+
+tests/test_comparison_with_fenics.py::test_comparison_with_fenics PASSED [ 25%]
+tests/test_isotropic.py::test_isotropic_stiffness_mass PASSED            [ 50%]
+tests/test_singular.py::test_singular_vs_direct PASSED                   [ 75%]
+tests/test_stress_strain.py::test_stress_strain_field PASSED             [100%]
+
+============================== warnings summary ===============================
+tests/test_comparison_with_fenics.py::test_comparison_with_fenics
+tests/test_isotropic.py::test_isotropic_stiffness_mass
+tests/test_singular.py::test_singular_vs_direct
+tests/test_stress_strain.py::test_stress_strain_field
+  C:\Users\Admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\skfem\utils.py:116: SparseEfficiencyWarning: spsolve requires A be CSC or CSR matrix format
+    return spl.spsolve(A, b, **kwargs)
+
+tests/test_comparison_with_fenics.py::test_comparison_with_fenics
+  C:\Users\Admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_comparison_with_fenics.py::test_comparison_with_fenics returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_isotropic.py::test_isotropic_stiffness_mass
+  C:\Users\Admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_isotropic.py::test_isotropic_stiffness_mass returned <class 'tuple'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_singular.py::test_singular_vs_direct
+  C:\Users\Admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_singular.py::test_singular_vs_direct returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_stress_strain.py::test_stress_strain_field
+  C:\Users\Admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_stress_strain.py::test_stress_strain_field returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 4 passed, 8 warnings in 6.11s ========================

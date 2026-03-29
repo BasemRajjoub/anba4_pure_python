@@ -1,51 +1,91 @@
-[![Actions Status](https://github.com/ANBA4/anba4/workflows/CI_anba4/badge.svg?branch=master)](https://github.com/ANBA4/anba4/actions)
-[![Coverage Status](https://coveralls.io/repos/github/ANBA4/anba4/badge.svg?branch=master)](https://coveralls.io/github/ANBA4/anba4?branch=master)
+# ANBA4-skfem
 
-# ANBA4
-ANBA4 computes the 6x6 stiffness and mass matrices of arbitrarily complex composite beam cross sections.
+A FEniCS-free port of ANBA4 for cross-section beam analysis using scikit-fem.
 
-## Theory
+## Description
 
-The theory of ANBA4 is described in this work (and references therein):
-Marco Morandini, Maria Chierichetti and Paolo Mantegazza, "Characteristic Behavior of Prismatic Anisotropic Beam Via Generalized Eigenvectors", International Journal of Solids and Structures, Volume 47, Issue 10, 15 May 2010, pp. 1327-1337, https://dx.doi.org/doi:10.1016/j.ijsolstr.2010.01.017, ISSN 0020-7683.
+ANBA4-skfem computes 6x6 stiffness and mass matrices of composite beam cross sections based on the generalized eigenvector theory from Morandini et al. (2010) "Characteristic behavior of prismatic anisotropic beam via generalized eigenvectors".
 
-ANBA4 has recently been verified against the commercial solver VABS and validated against experimental measurements. The comparison is described in
+This port replaces FEniCS with scikit-fem for FEM assembly and scipy for linear algebra, enabling Windows compatibility without requiring FEniCS installation.
 
-Roland Feil, Tobias Pflumm, Pietro Bortolotti and Marco Morandini,  "A cross-sectional aeroelastic analysis and structural optimization tool for slender composite structures", Composite Structures,
-Volume 253, Issue 1, December 2020, 112755, https://doi.org/10.1016/j.compstruct.2020.112755.
+## Features
 
-## Lincense
-
-GPL v3, see COPYING
+- Compute 6x6 stiffness matrix (EA, GJ, EI22, EI33, GA22, GA33)
+- Compute 6x6 mass matrix
+- Stress and strain field recovery
+- Support for isotropic and orthotropic materials
+- Triangular and quadrilateral meshes
+- Linear and quadratic elements
 
 ## Installation
 
-ANBA4 depends on Dolfin, from https://www.fenicsproject.org
+```bash
+pip install numpy scipy scikit-fem
+```
 
-Due to this dependency, ANBA4 currently only runs on Linux and Mac.
+## Usage
 
-If you need to stay on Windows your best bets are either the 
-Windows Subsystem for Linux (WSL2, https://docs.microsoft.com/en-us/windows/wsl/ )
-or Docker (https://docs.microsoft.com/en-us/windows/dev-environment/docker/overview );
-see also https://fenicsproject.org/download/ .
+```python
+import numpy as np
+from skfem import MeshTri
+from anba4 import Anbax, IsotropicMaterial
 
-On laptop and personal computers, installation with [Anaconda](https://www.anaconda.com) is the suggested approach because of the ability to create self-contained environments suitable for testing and analysis.  If you choose to use Anaconda, keep in mind that ANBA4 needs the 64-bit version (https://www.anaconda.com/distribution/). 
+# Create mesh
+mesh = MeshTri.init_tensor(
+    np.linspace(-0.5, 0.5, 6),
+    np.linspace(-0.5, 0.5, 6)
+)
 
-The installation instructions below use the environment name, "anba4-env," but any name is acceptable.    
+# Define material (E=1, nu=0.33, rho=1.0)
+mat = IsotropicMaterial([1.0, 0.33], rho=1.0)
 
-1.  Setup and activate the Anaconda environment from a Terminal window
+# Material assignments for each element
+materials = np.zeros(mesh.nelements, dtype=int)
+plane_orientations = np.full(mesh.nelements, 90.0)
+fiber_orientations = np.zeros(mesh.nelements)
 
-        conda create -n anba4-env -y fenics=2019.1.0=py39hf3d152e_26 mshr=2019.1.0 python=3.9
-        conda activate anba4-env # (or source activate anba4-env)
+# Create analyzer
+anba = Anbax(mesh, 1, [mat], materials, plane_orientations, fiber_orientations)
 
-2.  Navigate to your preferred folder, clone the repository, and install anba4
-        
-        cd <toyourpreferredfolder>
-        git clone git@github.com:ANBA4/anba4.git # (or git clone https://github.com/ANBA4/anba4.git)
-        cd anba_v4
-        pip install -e .
+# Compute stiffness and mass
+K = anba.compute()
+M = anba.inertia()
 
-3.  Try running an example
-    
-        cd examples
-        python anbax_isotropic.py
+print(f"EA (axial): {K[2,2]:.6f}")
+print(f"GJ (torsion): {K[5,5]:.6f}")
+print(f"EI22 (bending x2): {K[3,3]:.6f}")
+print(f"EI33 (bending x3): {K[4,4]:.6f}")
+
+# Compute stress field for axial load
+force = [1.0, 0.0, 0.0]  # F1=1 (axial)
+moment = [0.0, 0.0, 0.0]
+stress = anba.stress_field(force, moment)
+```
+
+## Stiffness Matrix Convention
+
+The 6x6 stiffness matrix uses the following convention:
+- Row/Col 0: Shear V2 (force in x2 direction)
+- Row/Col 1: Shear V3 (force in x3 direction)
+- Row/Col 2: Axial N (force in x1 direction)
+- Row/Col 3: Bending M2 (moment about x2)
+- Row/Col 4: Bending M3 (moment about x3)
+- Row/Col 5: Torsion T (moment about x1)
+
+## Voigt Notation
+
+Stress and strain vectors use ANBA ordering:
+- [σ11, σ22, σ33, σ23, σ13, σ12]
+
+## License
+
+GNU General Public License v3
+
+## Credits
+
+Original ANBA4:
+- Copyright (C) 2018 Marco Morandini
+- https://github.com/manuelma/anba4
+
+scikit-fem port:
+- Copyright (C) 2024-2026 Basem Rajjoub

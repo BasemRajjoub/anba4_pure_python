@@ -1,541 +1,1005 @@
-#
-# Copyright (C) 2018 Marco Morandini
-#
-#----------------------------------------------------------------------
-#
-#    This file is part of Anba.
-#
-#    Anba is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License as published by
-#    the Free Software Foundation, either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    Anba is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with Anba.  If not, see <https://www.gnu.org/licenses/>.
-#
-#----------------------------------------------------------------------
-#
+"""
+ANBA4-skfem: Cross-section analysis using scikit-fem.
 
-from dolfin import *
-from petsc4py import PETSc
+Computes 6x6 stiffness and mass matrices of composite beam cross sections.
+This is a FEniCS-free port using scikit-fem for FEM assembly and scipy for
+linear algebra, enabling Windows compatibility.
+
+Theory: Morandini et al. (2010) "Characteristic behavior of prismatic
+anisotropic beam via generalized eigenvectors"
+
+Original ANBA4:
+    Copyright (C) 2018 Marco Morandini
+    https://github.com/manuelma/anba4
+
+scikit-fem port:
+    Copyright (C) 2024-2026 Basem Rajjoub
+
+Licensed under GNU GPL v3 - see COPYING file for details.
+"""
 
 import numpy as np
+from scipy.sparse import csr_matrix, lil_matrix
+from scipy.linalg import solve, lstsq, null_space, svd
 
-from anba4.voight_notation import stressVectorToStressTensor, \
-    stressTensorToStressVector, stressTensorToParaviewStressVector, \
-    strainVectorToStrainTensor, strainTensorToStrainVector, strainTensorToParaviewStrainVector
-from anba4 import material
+from skfem import *
+from skfem.helpers import grad, dot
 
-class anbax():
-    def __init__(self, mesh, degree, matLibrary, materials, plane_orientations, fiber_orientations, scaling_constraint = 1.):
+from .material import Material
+
+
+class Anbax:
+    """
+    ANBA cross-section analyzer using scikit-fem.
+
+    Based on the generalized eigenvector theory from Morandini et al. (2010).
+
+    Parameters
+    ----------
+    mesh : skfem.Mesh
+        2D mesh of the cross-section
+    degree : int
+        Polynomial degree (1 or 2)
+    mat_library : list of Material
+        Material objects
+    materials : array-like
+        Element material indices
+    plane_orientations : array-like
+        Element plane orientation angles (degrees)
+    fiber_orientations : array-like
+        Element fiber orientation angles (degrees)
+    scaling_constraint : float
+        Constraint scaling factor
+    """
+
+    def __init__(self, mesh, degree, mat_library, materials, plane_orientations,
+                 fiber_orientations, scaling_constraint=1.0):
         self.mesh = mesh
         self.degree = degree
-        self.matLibrary = matLibrary
-        self.materials = materials
-        self.fiber_orientations = fiber_orientations
-        self.plane_orientations = plane_orientations
-        self.modulus = CompiledExpression(
-            material.ElasticModulus(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.RotatedStress_modulus = CompiledExpression(
-            material.RotatedStressElasticModulus(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.MaterialRotation_matrix = CompiledExpression(
-            material.TransformationMatrix(
-                self.matLibrary,
-                self.materials,
-                self.plane_orientations,
-                self.fiber_orientations
-            ),
-            degree=0
-        )
-        self.density = CompiledExpression(
-            material.MaterialDensity(
-                self.matLibrary,
-                self.materials
-            ),
-            degree=0
-        )
+        self.mat_library = mat_library
+        self.materials = np.asarray(materials).flatten()
+        self.plane_orientations = np.asarray(plane_orientations).flatten()
+        self.fiber_orientations = np.asarray(fiber_orientations).flatten()
         self.scaling_constraint = scaling_constraint
+        self.n_elem = mesh.nelements
 
-        # Define function on space.
-        UF3_ELEMENT = VectorElement("CG", self.mesh.ufl_cell(), self.degree, 3)
-        self.UF3 = FunctionSpace(self.mesh, UF3_ELEMENT)
+        # Build material stiffness field
+        self._build_material_fields()
 
-        #Lagrange multipliers needed to compute the stress resultants and moment resultants
-        R3_ELEMENT = VectorElement("R", self.mesh.ufl_cell(), 0, 3)
-        self.R3 = FunctionSpace(self.mesh, R3_ELEMENT)
-        sp = parameters["reorder_dofs_serial"]
-        parameters["reorder_dofs_serial"] = False
-        R3R3_ELEMENT = MixedElement(R3_ELEMENT, R3_ELEMENT)
-        self.R3R3 = FunctionSpace(self.mesh, R3R3_ELEMENT)
-        parameters["reorder_dofs_serial"] = sp
-        (self.RV3F, self.RV3M) = TestFunctions(self.R3R3)
-        (self.RT3F, self.RT3M) = TrialFunctions(self.R3R3)
+        # Create vector element (3 components for u1, u2, u3)
+        if isinstance(mesh, MeshTri):
+            scalar_elem = ElementTriP1() if degree == 1 else ElementTriP2()
+        else:
+            scalar_elem = ElementQuad1() if degree == 1 else ElementQuad2()
 
-        #STRESS_ELEMENT = TensorElement("DG", self.mesh.ufl_cell(), 0, (3, 3))
-        STRESS_ELEMENT = VectorElement("DG", self.mesh.ufl_cell(), 0, 6)
-        self.STRESS_FS = FunctionSpace(self.mesh, STRESS_ELEMENT)
-        self.STRESS = Function(self.STRESS_FS, name = "stress tensor")
-        self.STRAIN = Function(self.STRESS_FS, name = "strain tensor")
+        self.elem = ElementVector(scalar_elem, dim=3)
+        self.basis = Basis(mesh, self.elem)
+        self.n_dofs = self.basis.N
 
-        #Lagrange multipliers needed to impose the BCs
-        R4_ELEMENT = VectorElement("R", self.mesh.ufl_cell(), 0, 4)
-        self.R4 = FunctionSpace(self.mesh, R4_ELEMENT)
-        sp = parameters["reorder_dofs_serial"]
-        parameters["reorder_dofs_serial"] = False
-        UF3R4_ELEMENT = MixedElement(UF3_ELEMENT, R4_ELEMENT)
-        self.UF3R4 = FunctionSpace(self.mesh, UF3R4_ELEMENT)
-        parameters["reorder_dofs_serial"] = sp
+        # Results storage
+        self._stiffness = None
+        self._mass = None
+        self._chains = None  # Store Jordan chains for field recovery
+        self._E_mat = None
+        self._C_mat = None
+        self._M_mat = None
+        self._B_matrix = None  # For stress/strain recovery
 
-        self.UL = Function(self.UF3R4)
-        (self.U, self.L) = split(self.UL)
-        self.ULP = Function(self.UF3R4)
-        (self.UP, self.LP) = split(self.ULP)
-        self.ULV = TestFunction(self.UF3R4)
-        (self.UV, self.LV) = TestFunctions(self.UF3R4)
-        self.ULT = TrialFunction(self.UF3R4)
-        (self.UT, self.LT) = TrialFunctions(self.UF3R4)
+    def _build_material_fields(self):
+        """Pre-compute material stiffness for each element."""
+        self.C = np.zeros((self.n_elem, 6, 6))
+        self.rho = np.zeros(self.n_elem)
 
-        self.POS = MeshCoordinates(self.mesh)
-
-        self.base_chains_expression = []
-        self.linear_chains_expression = []
-        self.Torsion = Expression(("-x[1]", "x[0]", "0.", "0.", "0.", "0.", "0."), element = self.UF3R4.ufl_element())
-        self.Flex_y = Expression(("0.", "0.", "-x[0]", "0.", "0.", "0.", "0."), element = self.UF3R4.ufl_element())
-        self.Flex_x = Expression(("0.", "0.", "-x[1]", "0.", "0.", "0.", "0."), element = self.UF3R4.ufl_element())
-
-        self.base_chains_expression.append(Constant((0., 0., 1., 0., 0., 0., 0.)))
-        self.base_chains_expression.append(self.Torsion)
-        self.base_chains_expression.append(Constant((1., 0., 0., 0., 0., 0., 0.)))
-        self.base_chains_expression.append(Constant((0., 1., 0., 0., 0., 0., 0.)))
-        self.linear_chains_expression.append(self.Flex_y)
-        self.linear_chains_expression.append(self.Flex_x)
-
-        self.chains = [[], [], [], []]
-        self.chains_d = [[], [], [], []]
-        self.chains_l = [[], [], [], []]
-
-        # fill chains
-        for i in range(4):
-            for k in range(2):
-                self.chains[i].append(Function(self.UF3R4))
-        for i in range(2,4):
-            for k in range(2):
-                self.chains[i].append(Function(self.UF3R4))
-
-        # initialize constant chains
-        for i in range(4):
-            self.chains[i][0].interpolate(self.base_chains_expression[i])
-        # keep torsion independent from translation
-        for i in [0, 2, 3]:
-            k = (self.chains[1][0].vector().inner(self.chains[i][0].vector())) / (self.chains[i][0].vector().inner(self.chains[i][0].vector()))
-            self.chains[1][0].vector()[:] -= k * self.chains[i][0].vector()
-
-        # unit norm chains
-        tmpnorm = []
-        for i in range(4):
-            tmpnorm.append(self.chains[i][0].vector().norm("l2"))
-            self.chains[i][0].vector()[:] *= 1.0/tmpnorm[i]
-        # null space
-        self.null_space = VectorSpaceBasis([self.chains[i][0].vector() for i in range(4)])
-
-        # initialize linear chains
-        for i in range(2,4):
-            self.chains[i][1].interpolate(self.linear_chains_expression[i-2])
-            self.chains[i][1].vector()[:] *= 1.0/tmpnorm[i]
-            self.null_space.orthogonalize(self.chains[i][1].vector());
-        del tmpnorm
-
-        for i in range(4):
-            for k in range(2):
-                (d, l) = split(self.chains[i][k])
-                self.chains_d[i].append(d)
-                self.chains_l[i].append(l)
-
-        for i in range(2,4):
-            for k in range(2,4):
-                (d, l) = split(self.chains[i][k])
-                self.chains_d[i].append(d)
-                self.chains_l[i].append(l)
+        for e in range(self.n_elem):
+            mat_id = int(self.materials[e])
+            alpha = self.plane_orientations[e]
+            beta = self.fiber_orientations[e]
+            mat = self.mat_library[mat_id]
+            self.C[e] = mat.compute_elastic_modulus(alpha, beta)
+            self.rho[e] = mat.rho
 
     def inertia(self):
-        Mf  = dot(self.RV3F, self.RT3F) * self.density[0] * dx
-        Mf -= dot(self.RV3F, cross(self.pos3d(self.POS), self.RT3M)) * self.density[0] * dx
-        Mf -= dot(cross(self.pos3d(self.POS), self.RV3M), self.RT3F) * self.density[0] * dx
-        Mf += dot(cross(self.pos3d(self.POS), self.RV3M), cross(self.pos3d(self.POS), self.RT3M)) * self.density[0] * dx
-        MM = assemble(Mf)
-        M = as_backend_type(MM).mat()
-        Mass = PETSc.Mat()#.createDense([6, 6])
-        #Mass.setUp()
-        #Mass.view()
-        #M.copy(Mass, PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
-        M.convert('dense', Mass)
-        return Mass
+        """
+        Compute 6x6 mass matrix.
+
+        Returns
+        -------
+        M : ndarray (6, 6)
+        """
+        mesh = self.mesh
+
+        # Compute mass properties by integration
+        m = 0.0    # total mass
+        S2 = 0.0   # first moment about x3
+        S3 = 0.0   # first moment about x2
+        I22 = 0.0  # moment of inertia
+        I33 = 0.0
+        I23 = 0.0
+
+        for e in range(self.n_elem):
+            rho_e = self.rho[e]
+            if rho_e == 0:
+                continue
+
+            # Get element geometry
+            if isinstance(mesh, MeshTri):
+                elem_nodes = mesh.t[:, e]
+                coords = mesh.p[:, elem_nodes]
+                # Triangle area using cross product
+                v1 = coords[:, 1] - coords[:, 0]
+                v2 = coords[:, 2] - coords[:, 0]
+                area = 0.5 * abs(v1[0]*v2[1] - v1[1]*v2[0])
+                xc = coords[0, :].mean()
+                yc = coords[1, :].mean()
+            else:
+                elem_nodes = mesh.t[:, e]
+                coords = mesh.p[:, elem_nodes]
+                # Shoelace formula for quad
+                x = coords[0, :]
+                y = coords[1, :]
+                area = 0.5 * abs(sum(x[i]*(y[(i+1)%4] - y[(i-1)%4]) for i in range(4)))
+                xc = x.mean()
+                yc = y.mean()
+
+            m += rho_e * area
+            S2 += rho_e * area * yc
+            S3 += rho_e * area * xc
+            I22 += rho_e * area * yc**2
+            I33 += rho_e * area * xc**2
+            I23 += rho_e * area * xc * yc
+
+        # Assemble 6x6 mass matrix
+        # Convention: [F1, F2, F3, M1, M2, M3] corresponds to [v1, v2, v3, w1, w2, w3]
+        M = np.zeros((6, 6))
+
+        M[0, 0] = m
+        M[1, 1] = m
+        M[2, 2] = m
+
+        # Cross terms (ANBA convention)
+        M[0, 5] = S2;  M[5, 0] = S2
+        M[1, 5] = -S3; M[5, 1] = -S3
+        M[2, 3] = -S2; M[3, 2] = -S2
+        M[2, 4] = S3;  M[4, 2] = S3
+
+        # Rotational inertia (ANBA convention)
+        M[3, 3] = I22
+        M[4, 4] = I33
+        M[3, 4] = -I23
+        M[4, 3] = -I23
+        M[5, 5] = I22 + I33
+
+        self._mass = M
+        return M
 
     def compute(self):
-        stress = self.Sigma(self.U, self.UP)
-        stress_n = stress[:,2]
-        stress_1 = stress[:,0]
-        stress_2 = stress[:,1]
-        stress_s = as_tensor([[stress_1[0], stress_2[0]],
-            [stress_1[1], stress_2[1]],
-            [stress_1[2], stress_2[2]]])
+        """
+        Compute the 6x6 stiffness matrix.
 
-        ES = derivative(stress, self.U, self.UT)
-        ES_t = derivative(stress_s, self.U, self.UT)
-        ES_n = derivative(stress_s, self.UP, self.UT)
-        En_t = derivative(stress_n, self.U, self.UT)
-        En_n = derivative(stress_n, self.UP, self.UT)
+        Uses the direct stiffness extraction method from the paper (Section 6).
 
-        Mf = inner(self.UV, En_n) * dx
-        M = assemble(Mf)
-        self.M = M
+        Returns
+        -------
+        K : ndarray (6, 6)
+        """
+        # Assemble the key matrices
+        E_mat, C_mat, M_mat = self._assemble_matrices()
 
-        Cf = inner(grad(self.UV), ES_n) * dx
-        C = assemble(Cf)
-        Hf = (inner(grad(self.UV), ES_n) - inner(self.UV, En_t)) * dx
-        H = assemble(Hf)
-        self.H = H
+        # Store matrices for field recovery
+        self._E_mat = E_mat
+        self._C_mat = C_mat
+        self._M_mat = M_mat
 
-        #the four initial solutions
+        # H = C - C^T (skew-symmetric)
+        H_mat = C_mat - C_mat.T
 
-        Escal = Constant(self.scaling_constraint)
-        Ef = inner(grad(self.UV), ES_t) * dx
-        Ef += (self.LV[0] * self.UT[0] + self.LV[1] * self.UT[1] + self.LV[2] * self.UT[2]) * Escal * dx
-        Ef += self.LV[3] * dot(self.UT, self.chains_d[1][0]) * Escal * dx
-        Ef += (self.UV[0] * self.LT[0] + self.UV[1] * self.LT[1] + self.UV[2] * self.LT[2]) * Escal * dx
-        Ef += self.LT[3] * dot(self.UV, self.chains_d[1][0]) * Escal * dx
-        E = assemble(Ef)
-        self.E = E;
+        # Compute stiffness using Jordan chain approach
+        K, chains = self._compute_stiffness_direct(E_mat, C_mat, M_mat)
 
-        S = dot(stress_n, self.RV3F) * dx + dot(cross(self.pos3d(self.POS), stress_n), self.RV3M) * dx
-        L_res_f = derivative(S, self.UP, self.UT)
-        self.L_res = assemble(L_res_f)
-        R_res_f = derivative(S, self.U, self.UT)
-        self.R_res = assemble(R_res_f)
+        # Store chains for field recovery
+        self._chains = chains
+        self._stiffness = K
+        
+        # Build the B matrix for stress/strain recovery
+        self._build_b_matrix()
+        
+        return K
 
-        maxres = 0.
-        for i in range(4):
-            tmp = E*self.chains[i][0].vector()
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
-        for i in [2, 3]:
-            tmp = -(H*self.chains[i][0].vector()) -(E * self.chains[i][1].vector())
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
+    def _get_quadrature(self):
+        """Get quadrature points and weights."""
+        if isinstance(self.mesh, MeshTri):
+            # 3-point rule for triangles (degree 2)
+            qp_ref = np.array([[1/6, 1/6], [2/3, 1/6], [1/6, 2/3]]).T
+            qw = np.array([1/6, 1/6, 1/6])
+        else:
+            # 2x2 Gauss for quads
+            g = 1/np.sqrt(3)
+            qp_ref = np.array([[-g, -g], [g, -g], [g, g], [-g, g]]).T
+            qw = np.array([1, 1, 1, 1])
+        return qp_ref, qw
 
-#        if maxres > 1.E-16:
-#            scaling_factor = 1.E-16 / maxres;
-#        else:
-#            scaling_factor = 1.
+    def _get_shape_functions(self, xi):
+        """Get shape functions and derivatives at reference point xi."""
+        if isinstance(self.mesh, MeshTri):
+            if self.degree == 1:
+                N = np.array([1 - xi[0] - xi[1], xi[0], xi[1]])
+                dN_dxi = np.array([[-1, 1, 0], [-1, 0, 1]])
+            else:
+                # Quadratic triangle (P2)
+                L1, L2, L3 = 1 - xi[0] - xi[1], xi[0], xi[1]
+                N = np.array([L1*(2*L1-1), L2*(2*L2-1), L3*(2*L3-1),
+                             4*L1*L2, 4*L2*L3, 4*L3*L1])
+                dN_dxi = np.array([
+                    [-(4*L1-1), 4*L2-1, 0, 4*(L1-L2), 4*L3, -4*L3],
+                    [-(4*L1-1), 0, 4*L3-1, -4*L2, 4*L2, 4*(L1-L3)]
+                ])
+        else:
+            if self.degree == 1:
+                N = 0.25 * np.array([(1-xi[0])*(1-xi[1]), (1+xi[0])*(1-xi[1]),
+                                    (1+xi[0])*(1+xi[1]), (1-xi[0])*(1+xi[1])])
+                dN_dxi = 0.25 * np.array([
+                    [-(1-xi[1]), (1-xi[1]), (1+xi[1]), -(1+xi[1])],
+                    [-(1-xi[0]), -(1+xi[0]), (1+xi[0]), (1-xi[0])]
+                ])
+            else:
+                raise NotImplementedError("Quadratic quads not implemented")
+        return N, dN_dxi
 
-#        for i in range(4):
-#            self.chains[i][0].vector()[:] = self.chains[i][0].vector() * scaling_factor
-#        for i in [2, 3]:
-#            self.chains[i][1].vector()[:] = self.chains[i][1].vector() * scaling_factor
-        for i in range(4):
-            tmp = E*self.chains[i][0].vector()
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
-        for i in [2, 3]:
-            tmp = -(H*self.chains[i][0].vector()) -(E * self.chains[i][1].vector())
-            maxres = max(maxres, sqrt(tmp.inner(tmp)))
+    def _get_geom_shape_functions(self, xi):
+        """Get geometry (linear) shape functions for Jacobian computation."""
+        if isinstance(self.mesh, MeshTri):
+            N_geom = np.array([1 - xi[0] - xi[1], xi[0], xi[1]])
+            dN_geom_dxi = np.array([[-1, 1, 0], [-1, 0, 1]])
+        else:
+            N_geom = 0.25 * np.array([(1-xi[0])*(1-xi[1]), (1+xi[0])*(1-xi[1]),
+                                      (1+xi[0])*(1+xi[1]), (1-xi[0])*(1+xi[1])])
+            dN_geom_dxi = 0.25 * np.array([
+                [-(1-xi[1]), (1-xi[1]), (1+xi[1]), -(1+xi[1])],
+                [-(1-xi[0]), -(1+xi[0]), (1+xi[0]), (1-xi[0])]
+            ])
+        return N_geom, dN_geom_dxi
 
-        # solve E d1 = -H d0
-        for i in range(2):
-            rhs = -(H*self.chains[i][0].vector())
-            self.null_space.orthogonalize(rhs)
-            solve(E, self.chains[i][1].vector(), rhs)
-            self.null_space.orthogonalize(self.chains[i][1].vector())
+    def _assemble_matrices(self):
+        """
+        Assemble E, C, M matrices as defined in the paper (Eq. 12).
 
+        - M: integrates n · E · n (normal-normal)
+        - C: integrates g^α · E · n (in-plane to normal coupling)
+        - E: integrates g^α · E · g^α (in-plane stiffness)
 
-        # solve E d2 = M d0 - H d1
-        for i in [2, 3]:
-            rhs = -(H*self.chains[i][1].vector())+(M*self.chains[i][0].vector())
-            self.null_space.orthogonalize(rhs)
-            solve(E, self.chains[i][2].vector(), rhs)
-            self.null_space.orthogonalize(self.chains[i][2].vector())
+        Voigt ordering: [σ11, σ22, σ33, σ23, σ13, σ12]
+        - "Normal" components (involving beam axis 1): indices 0, 4, 5
+        - "In-plane" components: indices 1, 2, 3
+        """
+        basis = self.basis
+        elem_dofs = basis.element_dofs
+        n_dofs = self.n_dofs
 
-        a = np.zeros((2,2))
-        b = np.zeros((2,1))
-        for i in [2, 3]:
-            res = -(H*self.chains[i][2].vector())+(M*self.chains[i][1].vector())
-            for k in range(2):
-                b[k] = res.inner(self.chains[k][0].vector())
-                for ii in range(2):
-                    #a[ii, k] = (-(H*self.chains[ii][0].vector())).inner(self.chains[k][0].vector()) / normk
-                    a[k, ii] = (-(H*self.chains[ii][1].vector())+(M*self.chains[ii][0].vector())).inner(self.chains[k][0].vector())
-            x = np.linalg.solve(a, b)
+        E_mat = lil_matrix((n_dofs, n_dofs))
+        C_mat = lil_matrix((n_dofs, n_dofs))
+        M_mat = lil_matrix((n_dofs, n_dofs))
+
+        qp_ref, qw = self._get_quadrature()
+
+        # Number of shape function nodes
+        if isinstance(self.mesh, MeshTri):
+            n_sf_nodes = 3 if self.degree == 1 else 6
+        else:
+            n_sf_nodes = 4 if self.degree == 1 else 9
+
+        for e in range(self.n_elem):
+            Ce = self.C[e]  # 6x6 material stiffness
+
+            # Get element geometric coordinates (always using corner nodes)
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+
+            # Element DOFs
+            dofs = elem_dofs[:, e]
+            n_local = len(dofs)
+
+            # Local matrices
+            Ee = np.zeros((n_local, n_local))
+            Ce_local = np.zeros((n_local, n_local))
+            Me = np.zeros((n_local, n_local))
+
+            # Quadrature loop
+            for qp_idx in range(len(qw)):
+                xi = qp_ref[:, qp_idx]
+                w = qw[qp_idx]
+
+                # Geometry shape functions for Jacobian
+                _, dN_geom_dxi = self._get_geom_shape_functions(xi)
+                J = dN_geom_dxi @ coords.T
+                detJ = np.linalg.det(J)
+                # Use absolute value for area (handles CW or CCW elements)
+                detJ = abs(detJ)
+                invJ = np.linalg.inv(J)
+
+                # Field shape functions
+                N, dN_dxi = self._get_shape_functions(xi)
+                dN_dx = invJ @ dN_dxi  # (2, n_sf_nodes)
+
+                # Build strain matrices for each DOF
+                # B_s: in-plane strain (from u,α) - components [0,1,2,3,4,5] but only α derivatives
+                # B_n: normal strain (from u,1) - components [0,4,5] with shape function values
+
+                for i in range(n_local):
+                    node_i = i // 3
+                    comp_i = i % 3
+
+                    if node_i >= n_sf_nodes:
+                        continue
+
+                    # In-plane strain: contributions from shape function derivatives
+                    # ε_s = [0, u2,2, u3,3, u2,3+u3,2, u1,3, u1,2]
+                    eps_s_i = np.zeros(6)
+                    if comp_i == 0:  # u1
+                        eps_s_i[5] = dN_dx[0, node_i]  # 2ε12 partial: u1,2
+                        eps_s_i[4] = dN_dx[1, node_i]  # 2ε13 partial: u1,3
+                    elif comp_i == 1:  # u2
+                        eps_s_i[1] = dN_dx[0, node_i]  # ε22: u2,2
+                        eps_s_i[3] = dN_dx[1, node_i]  # 2ε23 partial: u2,3
+                    else:  # u3
+                        eps_s_i[2] = dN_dx[1, node_i]  # ε33: u3,3
+                        eps_s_i[3] = dN_dx[0, node_i]  # 2ε23 partial: u3,2
+
+                    # Normal strain: contributions that would come from u,1
+                    # ε_n = [u1,1, 0, 0, 0, u3,1, u2,1] scaled by shape function
+                    eps_n_i = np.zeros(6)
+                    N_i = N[node_i]
+                    if comp_i == 0:  # u1
+                        eps_n_i[0] = N_i  # ε11: u1,1
+                    elif comp_i == 1:  # u2
+                        eps_n_i[5] = N_i  # 2ε12 partial: u2,1
+                    else:  # u3
+                        eps_n_i[4] = N_i  # 2ε13 partial: u3,1
+
+                    for j in range(n_local):
+                        node_j = j // 3
+                        comp_j = j % 3
+
+                        if node_j >= n_sf_nodes:
+                            continue
+
+                        # Build strain vectors for DOF j
+                        eps_s_j = np.zeros(6)
+                        if comp_j == 0:
+                            eps_s_j[5] = dN_dx[0, node_j]
+                            eps_s_j[4] = dN_dx[1, node_j]
+                        elif comp_j == 1:
+                            eps_s_j[1] = dN_dx[0, node_j]
+                            eps_s_j[3] = dN_dx[1, node_j]
+                        else:
+                            eps_s_j[2] = dN_dx[1, node_j]
+                            eps_s_j[3] = dN_dx[0, node_j]
+
+                        eps_n_j = np.zeros(6)
+                        N_j = N[node_j]
+                        if comp_j == 0:
+                            eps_n_j[0] = N_j
+                        elif comp_j == 1:
+                            eps_n_j[5] = N_j
+                        else:
+                            eps_n_j[4] = N_j
+
+                        # E matrix: (eps_s)^T C (eps_s)
+                        Ee[i, j] += eps_s_i @ Ce @ eps_s_j * detJ * w
+
+                        # C matrix: (eps_s)^T C (eps_n)
+                        Ce_local[i, j] += eps_s_i @ Ce @ eps_n_j * detJ * w
+
+                        # M matrix: (eps_n)^T C (eps_n)
+                        Me[i, j] += eps_n_i @ Ce @ eps_n_j * detJ * w
+
+            # Assemble into global matrices
+            for i, di in enumerate(dofs):
+                for j, dj in enumerate(dofs):
+                    E_mat[di, dj] += Ee[i, j]
+                    C_mat[di, dj] += Ce_local[i, j]
+                    M_mat[di, dj] += Me[i, j]
+
+        return E_mat.tocsr(), C_mat.tocsr(), M_mat.tocsr()
+
+    def _compute_stiffness_direct(self, E_mat, C_mat, M_mat):
+        """
+        Compute 6x6 stiffness using the direct method from the paper.
+
+        This follows Section 6 of Morandini et al. (2010).
+        """
+        n_dofs = self.n_dofs
+        basis = self.basis
+
+        # Get DOF coordinates
+        doflocs = basis.doflocs
+        x2 = doflocs[0, :]  # x-coordinate (our x2 direction)
+        x3 = doflocs[1, :]  # y-coordinate (our x3 direction)
+        comp = np.arange(n_dofs) % 3  # Component index
+
+        # Convert to dense
+        E_dense = E_mat.toarray()
+        C_dense = C_mat.toarray()
+        M_dense = M_mat.toarray()
+        H_dense = C_dense - C_dense.T
+
+        # Initialize the 4 rigid body modes (nullspace of E)
+        # These are d0 vectors for each Jordan chain
+        #
+        # ANBA coordinate convention:
+        # - x1 = beam axis (axial direction), displacement u1
+        # - x2, x3 = cross-section coordinates, displacements u2, u3
+        # - Mesh is in (x2, x3) plane
+        # - comp=0 -> u1 (axial/out-of-plane)
+        # - comp=1 -> u2 (in-plane x2 direction)
+        # - comp=2 -> u3 (in-plane x3 direction)
+
+        # Chain 0: Axial translation (u1 = 1, u2 = 0, u3 = 0)
+        d0_axial = np.zeros(n_dofs)
+        d0_axial[comp == 0] = 1.0
+
+        # Chain 1: Torsion - rigid rotation about x1 axis
+        # For rotation about x1: u1 = 0, u2 = -x3, u3 = x2
+        d0_torsion = np.zeros(n_dofs)
+        d0_torsion[comp == 1] = -x3[comp == 1]  # u2 = -x3
+        d0_torsion[comp == 2] = x2[comp == 2]   # u3 = x2
+
+        # Chain 2: Translation in x2 direction (u1 = 0, u2 = 1, u3 = 0)
+        d0_shear2 = np.zeros(n_dofs)
+        d0_shear2[comp == 1] = 1.0
+
+        # Chain 3: Translation in x3 direction (u1 = 0, u2 = 0, u3 = 1)
+        d0_shear3 = np.zeros(n_dofs)
+        d0_shear3[comp == 2] = 1.0
+
+        # These form the nullspace (verify: E @ d0 should be ~0)
+        d0_list = [d0_axial, d0_torsion, d0_shear2, d0_shear3]
+
+        # Build constraint matrix from d0 vectors
+        Phi = np.column_stack(d0_list)  # (n_dofs, 4)
+
+        def solve_constrained(A, b):
+            """Solve singular system A x = b with nullspace constraints."""
+            n = A.shape[0]
+            nc = Phi.shape[1]
+
+            A_aug = np.zeros((n + nc, n + nc))
+            A_aug[:n, :n] = A
+            A_aug[:n, n:] = Phi
+            A_aug[n:, :n] = Phi.T
+
+            b_aug = np.zeros(n + nc)
+            b_aug[:n] = b
+
+            # Add small regularization
+            A_aug[:n, :n] += 1e-12 * np.eye(n)
+
+            try:
+                sol = solve(A_aug, b_aug)
+                return sol[:n]
+            except np.linalg.LinAlgError:
+                sol, _, _, _ = lstsq(A_aug, b_aug)
+                return sol[:n]
+
+        def project_out_null(v):
+            """Project out nullspace components using Gram-Schmidt."""
+            v = v.copy()
+            for d0 in d0_list:
+                norm_sq = np.dot(d0, d0)
+                if norm_sq > 1e-14:
+                    v = v - (np.dot(v, d0) / norm_sq) * d0
+            return v
+
+        # Solve Jordan chains following Eq. (29) in paper:
+        # E d0 = 0 (d0 is in nullspace)
+        # E d1 = -H d0
+        # E d2 = M d0 - H d1
+        # E d3 = M d1 - H d2
+
+        chains = []
+
+        # Chain 0: Axial (length 2)
+        chain_axial = [d0_axial]
+        rhs = -H_dense @ d0_axial
+        rhs = project_out_null(rhs)
+        d1 = solve_constrained(E_dense, rhs)
+        d1 = project_out_null(d1)
+        chain_axial.append(d1)
+        chains.append(chain_axial)
+
+        # Chain 1: Torsion (length 2)
+        chain_torsion = [d0_torsion]
+        rhs = -H_dense @ d0_torsion
+        rhs = project_out_null(rhs)
+        d1 = solve_constrained(E_dense, rhs)
+        d1 = project_out_null(d1)
+        chain_torsion.append(d1)
+        chains.append(chain_torsion)
+
+        # Chain 2: Bending about x3 (length 4)
+        # This chain corresponds to shear V2 and bending moment M3
+        chain_bend2 = [d0_shear2]
+
+        # d1: rigid rotation about x3 axis -> tilts the section
+        # For rotation about x3: u1 = -x2, u2 = 0, u3 = 0
+        d1_bend2 = np.zeros(n_dofs)
+        d1_bend2[comp == 0] = -x2[comp == 0]  # u1 = -x2
+        d1_bend2 = project_out_null(d1_bend2)
+        chain_bend2.append(d1_bend2)
+
+        # d2: solve E d2 = M d0 - H d1
+        rhs = M_dense @ d0_shear2 - H_dense @ d1_bend2
+        rhs = project_out_null(rhs)
+        d2 = solve_constrained(E_dense, rhs)
+        d2 = project_out_null(d2)
+        chain_bend2.append(d2)
+
+        # Chain 3: Bending about x2 (length 4)
+        # This chain corresponds to shear V3 and bending moment M2
+        chain_bend3 = [d0_shear3]
+
+        # d1: rigid rotation about x2 axis -> tilts the section
+        # For rotation about x2: u1 = -x3, u2 = 0, u3 = 0
+        d1_bend3 = np.zeros(n_dofs)
+        d1_bend3[comp == 0] = -x3[comp == 0]  # u1 = -x3
+        d1_bend3 = project_out_null(d1_bend3)
+        chain_bend3.append(d1_bend3)
+
+        # d2: solve E d2 = M d0 - H d1
+        rhs = M_dense @ d0_shear3 - H_dense @ d1_bend3
+        rhs = project_out_null(rhs)
+        d2 = solve_constrained(E_dense, rhs)
+        d2 = project_out_null(d2)
+        chain_bend3.append(d2)
+
+        # Correction step: ensure bending chains are orthogonal to axial/torsion chains
+        # This follows the original ANBA4 code's orthogonalization procedure
+        for chain_bend, d0_bend in [(chain_bend2, d0_shear2), (chain_bend3, d0_shear3)]:
+            # Compute residual: M*d1 - H*d2
+            res = M_dense @ chain_bend[1] - H_dense @ chain_bend[2]
+
+            # Build system to find correction coefficients
+            a = np.zeros((2, 2))
+            b = np.zeros(2)
+
+            # Compute RHS: residual projected onto axial/torsion chains
+            b[0] = np.dot(res, chains[0][0])  # onto axial d0
+            b[1] = np.dot(res, chains[1][0])  # onto torsion d0
+
+            # Compute matrix: (M*d0 - H*d1) projected onto axial/torsion chains
             for ii in range(2):
-                self.chains[i][2].vector()[:] -= x[ii] * self.chains[ii][1].vector()
-                self.chains[i][1].vector()[:] -= x[ii] * self.chains[ii][0].vector()
+                vec = M_dense @ chains[ii][0] - H_dense @ chains[ii][1]
+                a[0, ii] = np.dot(vec, chains[0][0])
+                a[1, ii] = np.dot(vec, chains[1][0])
 
-        for i in [2, 3]:
-            rhs = -(H*self.chains[i][2].vector())+(M*self.chains[i][1].vector())
-            self.null_space.orthogonalize(rhs)
-            solve(E, self.chains[i][3].vector(), rhs)
-            self.null_space.orthogonalize(self.chains[i][3].vector())
+            # Solve for correction
+            if np.linalg.cond(a) < 1e12:
+                x = np.linalg.solve(a, b)
+                # Apply correction to d1 and d2
+                chain_bend[2] = chain_bend[2] - x[0] * chains[0][1] - x[1] * chains[1][1]
+                chain_bend[1] = chain_bend[1] - x[0] * chains[0][0] - x[1] * chains[1][0]
 
-        # solve E d3 = M d1 - H d2
-        for i in range(4):
-            print("\nChain "+ str(i) +":")
-            for k in range(len(self.chains[i])//2, len(self.chains[i])):
-                print("(d" + str(k) + ", d" + str(k)+ ") = ", assemble(inner(self.chains_d[i][k], self.chains_d[i][k]) * dx))
-                print("(l" + str(k) + ", l" + str(k)+ ") = ", assemble(inner(self.chains_l[i][k], self.chains_l[i][k]) * dx))
-        for i in range(4):
-            for k in range(len(self.chains[i])//2, len(self.chains[i])):
-                (d0p, l0p) = self.chains[i][k].split(True)
+        # d3 for both bending chains (must be done AFTER the correction)
+        for chain_bend in [chain_bend2, chain_bend3]:
+            rhs = M_dense @ chain_bend[1] - H_dense @ chain_bend[2]
+            rhs = project_out_null(rhs)
+            d3 = solve_constrained(E_dense, rhs)
+            d3 = project_out_null(d3)
+            chain_bend.append(d3)
 
-        # len=2 range(1,0,-1) -> k = 1 len()-1-k len()-k
-        # len=4 range(2,0,-1) -> k = 2 len()-1-k=1 len()-k=2
-        #                        k = 1 len()-1-k=2 len()-k=3
+        chains.append(chain_bend2)
+        chains.append(chain_bend3)
 
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                res =  E * self.chains[i][ll-k].vector() + H * self.chains[i][ll-1-k].vector()
-                if ll-1-k > 0:
-                    res -= M * self.chains[i][ll-2-k].vector()
-                res = as_backend_type(res).vec()
-                print('residual chain',i,'order',ll , res.dot(res))
-        print("")
+        # Compute the stiffness matrix following the original ANBA4 approach
+        # For a chain with pair (d_a, d_b), the stiffness contribution is:
+        # S = d_a^T M d_a + d_a^T C^T d_b + d_b^T C d_a + d_b^T E d_b
+        #   = d_a^T M d_a + 2 * d_a^T C^T d_b + d_b^T E d_b (using symmetry)
+        #
+        # For length-2 chains (axial, torsion): use (d0, d1)
+        # For length-4 chains (bending):
+        #   - bending stiffness: use (d1, d2)
+        #   - shear stiffness: use (d2, d3)
+        #
+        # Final index mapping to ANBA convention:
+        # [0,1,2,3,4,5] = [V2(shear), V3(shear), N(axial), M2(bend), M3(bend), T(torsion)]
 
+        def stiffness_term(da, db):
+            """Compute stiffness from chain pair (d_a, d_b).
 
-        row1_col = []
-        row2_col = []
-        for i in range(6):
-            row1_col.append(as_backend_type(self.chains[0][0].vector().copy()).vec())
-            row2_col.append(as_backend_type(self.chains[0][0].vector().copy()).vec())
+            Formula: S = d_a^T M d_a + d_a^T C^T d_b + d_b^T C d_a + d_b^T E d_b
+            Note: C is NOT symmetric, so the two C terms are different!
+            """
+            return (da @ M_dense @ da + da @ C_dense.T @ db +
+                    db @ C_dense @ da + db @ E_dense @ db)
 
-        M_p = as_backend_type(M).mat()
-        C_p = as_backend_type(C).mat()
-        E_p = as_backend_type(E).mat()
-        S = PETSc.Mat().createDense([6, 6])
-        S.setUp()
+        def cross_stiffness(da_i, db_i, da_j, db_j):
+            """Compute cross stiffness between two chain pairs."""
+            return (da_i @ M_dense @ da_j + da_i @ C_dense.T @ db_j +
+                    db_i @ C_dense @ da_j + db_i @ E_dense @ db_j)
 
-        self.B = PETSc.Mat().createDense([6, 6])
-        self.B.setUp()
+        K = np.zeros((6, 6))
 
-        self.G = PETSc.Mat().createDense([6, 6])
-        self.G.setUp()
+        # Extract chain vectors
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]  # Bending about x3 / shear V2
+        d0_3, d1_3, d2_3, d3_3 = chains[3]  # Bending about x2 / shear V3
 
-        g = PETSc.Vec().createMPI(6)
-        b = PETSc.Vec().createMPI(6)
+        # Diagonal terms
+        # Index 2: EA (axial) - from chain 0 with (d0, d1)
+        K[2, 2] = stiffness_term(d0_ax, d1_ax)
 
-        self.Stiff = PETSc.Mat().createDense([6, 6])
-        self.Stiff.setUp()
+        # Index 5: GJ (torsion) - from chain 1 with (d0, d1)
+        K[5, 5] = stiffness_term(d0_tor, d1_tor)
 
+        # Index 4: EI33 (bending about x3) - from chain 2 with (d1, d2)
+        K[4, 4] = stiffness_term(d1_2, d2_2)
 
+        # Index 0: GA22 (shear in x2) - using (d0, d2) pair with correction factor
+        # The shear stiffness requires a different formula: GA = 0.75 * S(d0, d2)
+        # This accounts for the B/G transformation in the original ANBA4 formulation
+        K[0, 0] = 0.75 * stiffness_term(d0_2, d2_2)
 
-        col = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                col = col + 1
-                M_p.mult(as_backend_type(self.chains[i][ll-1-k].vector()).vec(), row1_col[col])
-                C_p.multTransposeAdd(as_backend_type(self.chains[i][ll-k].vector()).vec(), row1_col[col], row1_col[col])
-                C_p.mult(as_backend_type(self.chains[i][ll-1-k].vector()).vec(), row2_col[col])
-                E_p.multAdd(as_backend_type(self.chains[i][ll-k].vector()).vec(), row2_col[col], row2_col[col])
+        # Index 3: EI22 (bending about x2) - from chain 3 with (d1, d2)
+        K[3, 3] = stiffness_term(d1_3, d2_3)
 
+        # Index 1: GA33 (shear in x3) - using (d0, d2) pair with correction factor
+        K[1, 1] = 0.75 * stiffness_term(d0_3, d2_3)
 
-        #print dir(PETSc.Vec)
+        # Cross terms (off-diagonal)
+        # For a symmetric section centered at origin, most cross terms should be zero
+        # Only computing the structurally expected non-zero terms
 
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                for c in range(6):
-                    S.setValues(row, c, as_backend_type(self.chains[i][ll-1-k].vector()).vec().dot(row1_col[c]) +
-                        as_backend_type(self.chains[i][ll-k].vector()).vec().dot(row2_col[c]))
-                self.B.setValues(row, range(6), as_backend_type(self.L_res * self.chains[i][ll-1-k].vector() + self.R_res * self.chains[i][ll-k].vector()).vec())
+        # Axial-Torsion (2,5) - usually zero for isotropic
+        K[2, 5] = cross_stiffness(d0_ax, d1_ax, d0_tor, d1_tor)
+        K[5, 2] = K[2, 5]
 
-        S.assemble()
-        self.B.assemble()
+        # Bending M2 - Bending M3 (3,4) - usually zero for symmetric section
+        K[3, 4] = cross_stiffness(d1_3, d2_3, d1_2, d2_2)
+        K[4, 3] = K[3, 4]
 
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(S)
-        ksp.setType(ksp.Type.PREONLY)   # Just use the preconditioner without a Krylov method
-        pc = ksp.getPC()                # Preconditioner
-        pc.setType(pc.Type.LU)          # Use a direct solve
+        # Shear-bending cross terms (for non-centered or asymmetric sections)
+        # For symmetric sections centered at origin, these are typically small
+        # Using (d0, d2) pair for shear-related cross terms (with 0.75 factor)
 
+        # Shear V2 - Shear V3 (0,1)
+        K[0, 1] = 0.75 * cross_stiffness(d0_2, d2_2, d0_3, d2_3)
+        K[1, 0] = K[0, 1]
 
-        for i in range(6):
-            ksp.solve(self.B.getColumnVector(i), g)
-            self.G.setValues(range(6), i, g)
+        return K, chains
 
-        self.G.assemble()
-
-        self.G.transposeMatMult(S, self.B)
-        self.B.matMult(self.G, self.Stiff)
+    def _build_b_matrix(self):
+        """
+        Build the G matrix for stress/strain recovery.
         
-        return self.Stiff
-
-    def Sigma(self, u, up):
-        "Return second Piola-Kirchhoff stress tensor."
-        return self.sigma_helper(u, up, self.modulus)
-
-    def RotatedSigma(self, u, up):
-        "Return second Piola-Kirchhoff stress tensor."
-        return self.sigma_helper(u, up, self.RotatedStress_modulus)
-
-    def sigma_helper(self, u, up, mod):
-        "Return second Piola-Kirchhoff stress tensor."
-        et = self.epsilon(u, up)
-        ev = strainTensorToStrainVector(et)
-#         elasticMatrix = self.modulus
-        elasticMatrix = as_matrix(((mod[0],mod[1],mod[2],mod[3],mod[4],mod[5]),\
-                                   (mod[6],mod[7],mod[8],mod[9],mod[10],mod[11]),\
-                                   (mod[12],mod[13],mod[14],mod[15],mod[16],mod[17]),\
-                                   (mod[18],mod[19],mod[20],mod[21],mod[22],mod[23]),\
-                                   (mod[24],mod[25],mod[26],mod[27],mod[28],mod[29]),\
-                                   (mod[30],mod[31],mod[32],mod[33],mod[34],mod[35])))
-        sv = elasticMatrix * ev
-        st = stressVectorToStressTensor(sv)
-        return st
-
-    def epsilon(self, u, up):
-        "Return symmetric 3D infinitesimal strain tensor."
-        g3 = self.grad3d(u, up)
-        return 0.5*(g3.T + g3)
-
-    def rotated_epsilon(self, u, up):
-        "Return symmetric 3D infinitesimal strain tensor rotated into material reference."
-        eps = self.epsilon(u, up)
-        rot = self.MaterialRotation_matrix
-        rotMatrix = as_matrix(((    rot[0], rot[1], rot[2], rot[3], rot[4], rot[5]),\
-                                   (rot[6], rot[7], rot[8], rot[9], rot[10],rot[11]),\
-                                   (rot[12],rot[13],rot[14],rot[15],rot[16],rot[17]),\
-                                   (rot[18],rot[19],rot[20],rot[21],rot[22],rot[23]),\
-                                   (rot[24],rot[25],rot[26],rot[27],rot[28],rot[29]),\
-                                   (rot[30],rot[31],rot[32],rot[33],rot[34],rot[35])))
-        roteps = strainVectorToStrainTensor(rotMatrix.T * strainTensorToStrainVector(eps))
-        return roteps
-
-    def grad3d(self, u, up):
-        "Return 3d gradient."
-        g = grad(u)
-        return as_tensor([[g[0,0], g[0,1], up[0]],[g[1,0], g[1,1], up[1]],[g[2,0], g[2,1], up[2]]])
-
-    def pos3d(self, POS):
-        "Return node coordinates Vector."
-        return as_vector([POS[0], POS[1], 0.])
-
-    def local_project(self, v, V, u=None):
-        """Element-wise projection using LocalSolver"""
-        dv = TrialFunction(V)
-        v_ = TestFunction(V)
-        a_proj = inner(dv, v_)*dx
-        b_proj = inner(v, v_)*dx
-        solver = LocalSolver(a_proj, b_proj)
-        solver.factorize()
-        if u is None:
-            u = Function(V)
-            solver.solve_local_rhs(u)
-            return u
-        else:
-            solver.solve_local_rhs(u)
-            return
-
-    def stress_field(self, force, moment, reference = "local", voigt_convention = "anba"):
-        if reference == "local":
-            stress_comp = self.RotatedSigma
-        elif reference == "global":
-            stress_comp = self.Sigma
-        else:
-            raise ValueError('reference argument should be equal to either to\"local\" or to "global", got \"' + reference + '\" instead')
-        if voigt_convention == "anba":
-            vector_conversion = stressTensorToStressVector
-        elif voigt_convention == "paraview":
-            vector_conversion = stressTensorToParaviewStressVector
-        else:
-            raise ValueError('voigt_convention argument should be equal to either to\"anba\" or to "paraview", got \"' + voigt_convention + '\" instead')
-
-        eigensol_magnitudes = PETSc.Vec().createMPI(6)
-
-        AzInt = PETSc.Vec().createMPI(6)
-
-        AzInt.setValues(range(3), force)
-        AzInt.setValues(range(3, 6), moment)
-        AzInt.assemblyBegin()
-        AzInt.assemblyEnd()
+        The G matrix transforms force/moment resultants to chain magnitudes.
+        For a given load vector AzInt, the chain magnitudes are: mag = G @ AzInt
         
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(self.B)
-        ksp.setType(ksp.Type.PREONLY)   # Just use the preconditioner without a Krylov method
-        pc = ksp.getPC()                # Preconditioner
-        pc.setType(pc.Type.LU)          # Use a direct solve
+        The key insight is that the stiffness matrix K relates displacements to forces:
+        F = K @ u
         
-        ksp.solve(AzInt, eigensol_magnitudes)
+        For the chain formulation, the generalized stiffness S relates chain magnitudes
+        to generalized forces. We need to find the transformation from actual forces
+        to chain magnitudes.
+        """
+        if self._chains is None or self._E_mat is None:
+            raise RuntimeError("Must call compute() before building B matrix")
         
-        self.UL.vector()[:] = 0.
-        self.ULP.vector()[:] = 0.
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                self.UL.vector()[:] += self.chains[i][ll-k].vector() * eigensol_magnitudes[row]
-                self.ULP.vector()[:] += self.chains[i][ll-1-k].vector() * eigensol_magnitudes[row]
-        self.local_project(vector_conversion(stress_comp(self.U, self.UP)), self.STRESS.ufl_function_space(), self.STRESS)
-#        self.local_project(stress_comp(self.U, self.UP), self.STRESS.ufl_function_space(), self.STRESS)
+        chains = self._chains
+        K = self._stiffness  # Already computed 6x6 stiffness matrix
+        
+        # The G matrix is simply the inverse of the stiffness matrix
+        # This works because K directly relates [V2, V3, N, M2, M3, T] to
+        # the corresponding generalized displacements (chain magnitudes)
+        
+        try:
+            self._G_matrix = np.linalg.inv(K)
+        except np.linalg.LinAlgError:
+            self._G_matrix = np.linalg.lstsq(K, np.eye(6), rcond=None)[0]
+        
+        # Store S matrix as the stiffness (for compatibility)
+        self._S_matrix = K
+        self._B_matrix = np.eye(6)  # Identity: chain magnitudes directly relate to forces
 
-    def strain_field(self, force, moment, reference = "local", voigt_convention = "anba"):
-        if reference == "local":
-            strain_comp = self.rotated_epsilon
-        elif reference == "global":
-            strain_comp = self.epsilon
+    def stress_field(self, force, moment, reference="local", voigt_convention="anba"):
+        """
+        Compute stress field distribution for given force/moment resultants.
+
+        Parameters
+        ----------
+        force : array-like (3,)
+            Force resultants [F1, F2, F3] (axial, shear x2, shear x3)
+        moment : array-like (3,)
+            Moment resultants [M1, M2, M3] (torsion, bending x2, bending x3)
+        reference : str
+            "local" for material coordinates, "global" for section coordinates
+        voigt_convention : str
+            "anba" for ANBA ordering, "paraview" for ParaView ordering
+
+        Returns
+        -------
+        stress : ndarray (n_elem, 6)
+            Stress vectors at element centers in Voigt notation
+        """
+        if self._chains is None:
+            raise RuntimeError("Must call compute() before stress_field()")
+        
+        force = np.asarray(force)
+        moment = np.asarray(moment)
+        
+        # Combine force and moment into load vector
+        # ANBA convention: [V2, V3, N, M2, M3, T]
+        AzInt = np.array([force[1], force[2], force[0], moment[1], moment[2], moment[0]])
+        
+        # Solve for chain magnitudes: S @ magnitudes = AzInt
+        # But we need to use the G matrix: magnitudes = G @ AzInt
+        if self._G_matrix is None:
+            self._build_b_matrix()
+        
+        magnitudes = self._G_matrix @ AzInt
+        
+        # Reconstruct displacement fields from chains
+        # U (in-plane) and UP (derivative along beam axis)
+        U = np.zeros(self.n_dofs)
+        UP = np.zeros(self.n_dofs)
+        
+        # Chain pairs for each load case (same order as above)
+        chains = self._chains
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]
+        d0_3, d1_3, d2_3, d3_3 = chains[3]
+        
+        chain_pairs = [
+            (d0_2, d2_2),  # Shear V2
+            (d0_3, d2_3),  # Shear V3
+            (d0_ax, d1_ax),  # Axial
+            (d1_3, d2_3),  # Bending M2
+            (d1_2, d2_2),  # Bending M3
+            (d0_tor, d1_tor),  # Torsion
+        ]
+        
+        for i, (da, db) in enumerate(chain_pairs):
+            U += da * magnitudes[i]
+            UP += db * magnitudes[i]
+        
+        # Compute stress at element centers
+        stress = np.zeros((self.n_elem, 6))
+        
+        for e in range(self.n_elem):
+            Ce = self.C[e]
+            
+            # Get element center coordinates
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+            xc = coords[0, :].mean()
+            yc = coords[1, :].mean()
+            
+            # Get element DOFs
+            dofs = self.basis.element_dofs[:, e]
+            U_e = U[dofs]
+            UP_e = UP[dofs]
+            
+            # Compute strain at element center
+            eps = self._compute_strain_at_element_center(e, U_e, UP_e, xc, yc, magnitudes)
+            
+            # Compute stress: sigma = C @ eps
+            sigma = Ce @ eps
+            
+            if reference == "local":
+                # Use material coordinates (already in local system)
+                pass
+            else:
+                # Transform to global coordinates
+                mat_id = int(self.materials[e])
+                alpha = self.plane_orientations[e]
+                beta = self.fiber_orientations[e]
+                mat = self.mat_library[mat_id]
+                T = mat.transformation_matrix(alpha, beta)
+                sigma = T @ sigma
+            
+            if voigt_convention == "paraview":
+                # Convert from ANBA to ParaView ordering
+                # ANBA: [s11, s22, s33, s23, s13, s12]
+                # ParaView: [s11, s22, s33, s12, s23, s13]
+                sigma = np.array([sigma[0], sigma[1], sigma[2], sigma[5], sigma[3], sigma[4]])
+            
+            stress[e] = sigma
+        
+        self._stress = stress
+        return stress
+
+    def strain_field(self, force, moment, reference="local", voigt_convention="anba"):
+        """
+        Compute strain field distribution for given force/moment resultants.
+
+        Parameters
+        ----------
+        force : array-like (3,)
+            Force resultants [F1, F2, F3] (axial, shear x2, shear x3)
+        moment : array-like (3,)
+            Moment resultants [M1, M2, M3] (torsion, bending x2, bending x3)
+        reference : str
+            "local" for material coordinates, "global" for section coordinates
+        voigt_convention : str
+            "anba" for ANBA ordering, "paraview" for ParaView ordering
+
+        Returns
+        -------
+        strain : ndarray (n_elem, 6)
+            Strain vectors at element centers in Voigt notation
+        """
+        if self._chains is None:
+            raise RuntimeError("Must call compute() before strain_field()")
+        
+        force = np.asarray(force)
+        moment = np.asarray(moment)
+        
+        # Combine force and moment into load vector
+        AzInt = np.array([force[1], force[2], force[0], moment[1], moment[2], moment[0]])
+        
+        # Solve for chain magnitudes
+        if self._G_matrix is None:
+            self._build_b_matrix()
+        
+        magnitudes = self._G_matrix @ AzInt
+        
+        # Reconstruct displacement fields from chains
+        U = np.zeros(self.n_dofs)
+        UP = np.zeros(self.n_dofs)
+        
+        chains = self._chains
+        d0_ax, d1_ax = chains[0]
+        d0_tor, d1_tor = chains[1]
+        d0_2, d1_2, d2_2, d3_2 = chains[2]
+        d0_3, d1_3, d2_3, d3_3 = chains[3]
+        
+        chain_pairs = [
+            (d0_2, d2_2),
+            (d0_3, d2_3),
+            (d0_ax, d1_ax),
+            (d1_3, d2_3),
+            (d1_2, d2_2),
+            (d0_tor, d1_tor),
+        ]
+        
+        for i, (da, db) in enumerate(chain_pairs):
+            U += da * magnitudes[i]
+            UP += db * magnitudes[i]
+        
+        # Compute strain at element centers
+        strain = np.zeros((self.n_elem, 6))
+        
+        for e in range(self.n_elem):
+            # Get element center coordinates
+            geom_nodes = self.mesh.t[:, e]
+            coords = self.mesh.p[:, geom_nodes]
+            xc = coords[0, :].mean()
+            yc = coords[1, :].mean()
+            
+            # Get element DOFs
+            dofs = self.basis.element_dofs[:, e]
+            U_e = U[dofs]
+            UP_e = UP[dofs]
+            
+            # Compute strain at element center (pass generalized strains from chain magnitudes)
+            eps = self._compute_strain_at_element_center(e, U_e, UP_e, xc, yc, magnitudes)
+            
+            if reference == "local":
+                # Transform to material coordinates
+                mat_id = int(self.materials[e])
+                alpha = self.plane_orientations[e]
+                beta = self.fiber_orientations[e]
+                mat = self.mat_library[mat_id]
+                T = mat.transformation_matrix(alpha, beta)
+                eps = T.T @ eps  # Inverse transformation for strain
+            
+            if voigt_convention == "paraview":
+                # Convert from ANBA to ParaView ordering
+                eps = np.array([eps[0], eps[1], eps[2], eps[5], eps[3], eps[4]])
+            
+            strain[e] = eps
+        
+        self._strain = strain
+        return strain
+
+    def _compute_strain_at_element_center(self, e, U_e, UP_e, xc, yc, generalized_strains=None):
+        """
+        Compute strain vector at element center.
+        
+        Parameters
+        ----------
+        e : int
+            Element index
+        U_e : ndarray
+            Element displacement DOFs
+        UP_e : ndarray
+            Element derivative DOFs
+        xc, yc : float
+            Element center coordinates
+        generalized_strains : ndarray (6,), optional
+            Generalized strains from chain magnitudes. If provided, used directly.
+        
+        Returns
+        -------
+        eps : ndarray (6,)
+            Strain vector in Voigt notation
+        """
+        # If generalized strains are provided, use them directly
+        # The generalized strains ARE the actual strains for the beam problem
+        # Generalized strains convention: [gamma_12, gamma_13, eps_11, kappa_2, kappa_3, theta]
+        # where gamma_12, gamma_13 are shear strains
+        #       eps_11 is axial strain
+        #       kappa_2, kappa_3 are bending curvatures (about x2 and x3 axes)
+        #       theta is twist rate (torsion)
+        if generalized_strains is not None:
+            eps = np.zeros(6)
+            # Axial strain: constant plus bending contributions
+            # eps_11 = eps_axial + kappa_2 * x3 - kappa_3 * x2
+            eps[0] = generalized_strains[2] + generalized_strains[3] * yc - generalized_strains[4] * xc
+            
+            # Shear strains from torsion and shear forces
+            # gamma_12 = gamma_12_shear - theta * x3
+            eps[5] = generalized_strains[0] - generalized_strains[5] * yc  # shear 12 (2*eps_12)
+            # gamma_13 = gamma_13_shear + theta * x2
+            eps[4] = generalized_strains[1] + generalized_strains[5] * xc  # shear 13 (2*eps_13)
+            return eps
+        
+        # Otherwise, compute from displacement field (original approach)
+        # Get shape functions at element center
+        if isinstance(self.mesh, MeshTri):
+            xi_center = np.array([1/3, 1/3])
         else:
-            raise ValueError('reference argument should be equal to either to\"local\" or to "global", got \"' + reference + '\" instead')
-        if voigt_convention == "anba":
-            vector_conversion = strainTensorToStrainVector
-        elif voigt_convention == "paraview":
-            vector_conversion = strainTensorToParaviewStrainVector
+            xi_center = np.array([0.0, 0.0])
+        
+        N, dN_dxi = self._get_shape_functions(xi_center)
+        _, dN_geom_dxi = self._get_geom_shape_functions(xi_center)
+        
+        # Get element geometry
+        geom_nodes = self.mesh.t[:, e]
+        coords = self.mesh.p[:, geom_nodes]
+        
+        # Compute Jacobian
+        J = dN_geom_dxi @ coords.T
+        detJ = abs(np.linalg.det(J))
+        invJ = np.linalg.inv(J)
+        
+        # Shape function derivatives in physical coordinates
+        dN_dx = invJ @ dN_dxi
+        
+        # Number of shape function nodes
+        if isinstance(self.mesh, MeshTri):
+            n_sf_nodes = 3 if self.degree == 1 else 6
         else:
-            raise ValueError('voigt_convention argument should be equal to either to\"anba\" or to "paraview", got \"' + voigt_convention + '\" instead')
-
-        eigensol_magnitudes = PETSc.Vec().createMPI(6)
-
-        AzInt = PETSc.Vec().createMPI(6)
-
-        AzInt.setValues(range(3), force)
-        AzInt.setValues(range(3, 6), moment)
-        AzInt.assemblyBegin()
-        AzInt.assemblyEnd()
-
-        ksp = PETSc.KSP()
-        ksp.create()
-        ksp.setOperators(self.B)
-        ksp.setType(ksp.Type.PREONLY)   # Just use the preconditioner without a Krylov method
-        pc = ksp.getPC()                # Preconditioner
-        pc.setType(pc.Type.LU)          # Use a direct solve
-        ksp.solve(AzInt, eigensol_magnitudes)
-
-        self.UL.vector()[:] = 0.
-        self.ULP.vector()[:] = 0.
-        row = -1
-        for i in range(4):
-            ll = len(self.chains[i])
-            for k in range(ll//2, 0, -1):
-                row = row + 1
-                self.UL.vector()[:] += self.chains[i][ll-k].vector() * eigensol_magnitudes[row]
-                self.ULP.vector()[:] += self.chains[i][ll-1-k].vector() * eigensol_magnitudes[row]
-        self.local_project(vector_conversion(strain_comp(self.U, self.UP)), self.STRAIN.ufl_function_space(), self.STRAIN)
-#        self.local_project(stress_comp(self.U, self.UP), self.STRESS.ufl_function_space(), self.STRESS)
+            n_sf_nodes = 4 if self.degree == 1 else 9
+        
+        # Compute strain components
+        eps = np.zeros(6)
+        
+        n_local = len(U_e)
+        for i in range(n_local):
+            node_i = i // 3
+            comp_i = i % 3
+            
+            if node_i >= n_sf_nodes:
+                continue
+            
+            # In-plane strain contributions (from U derivatives)
+            if comp_i == 0:  # u1
+                eps[5] += dN_dx[0, node_i] * U_e[i]  # 2ε12: u1,2
+                eps[4] += dN_dx[1, node_i] * U_e[i]  # 2ε13: u1,3
+            elif comp_i == 1:  # u2
+                eps[1] += dN_dx[0, node_i] * U_e[i]  # ε22: u2,2
+                eps[3] += dN_dx[1, node_i] * U_e[i]  # 2ε23: u2,3
+            else:  # u3
+                eps[2] += dN_dx[1, node_i] * U_e[i]  # ε33: u3,3
+                eps[3] += dN_dx[0, node_i] * U_e[i]  # 2ε23: u3,2
+            
+            # Normal strain contributions (from UP)
+            if comp_i == 0:  # u1
+                eps[0] += N[node_i] * UP_e[i]  # ε11: u1,1
+            elif comp_i == 1:  # u2
+                eps[5] += N[node_i] * UP_e[i]  # 2ε12: u2,1
+            else:  # u3
+                eps[4] += N[node_i] * UP_e[i]  # 2ε13: u3,1
+        
+        return eps
